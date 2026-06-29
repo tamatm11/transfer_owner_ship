@@ -1,0 +1,22 @@
+# Secrets - never commit
+.env
+.env.*
+!.env.example
+token.json
+token_B.json
+credentials.json
+account_b_accounts.json
+account_b_tokens/
+account_a_accounts.json
+account_a_tokens/
+__pycache__/
+*.pyc
+.web_*.log
+.oauth_*.log
+.qa-*.png
+
+# Dependencies & build artifacts - không commit
+node_modules/
+web/dist/
+*.tsbuildinfo
+.vercel/

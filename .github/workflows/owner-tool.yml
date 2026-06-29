@@ -1,0 +1,56 @@
+name: owner-tool-job
+run-name: "owner-tool ${{ inputs.kind }} ${{ inputs.job_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: "transfer | block"
+        required: true
+        type: string
+      job_id:
+        description: "Job id sinh bởi web (dùng để map trạng thái)"
+        required: true
+        type: string
+      payload:
+        description: "JSON payload (owner_email, rows/folders, mode, scope, flags)"
+        required: true
+        type: string
+
+# Chạy tuần tự để không đụng quota Drive. Bỏ block này nếu muốn chạy song song.
+concurrency:
+  group: owner-tool-drive
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore credentials.json
+        env:
+          CREDS_B64: ${{ secrets.CREDENTIALS_JSON_B64 }}
+        run: |
+          if [ -n "$CREDS_B64" ]; then
+            printf '%s' "$CREDS_B64" | base64 -d > credentials.json
+            echo "credentials.json restored."
+          else
+            echo "Không có secret CREDENTIALS_JSON_B64 — bỏ qua (chỉ cần khi token B phải refresh bằng client config)."
+          fi
+
+      - name: Run job
+        env:
+          GHA_JOB_KIND: ${{ inputs.kind }}
+          GHA_JOB_PAYLOAD: ${{ inputs.payload }}
+          OWNER_TOOL_ACCOUNTS_JSON_B64: ${{ secrets.OWNER_TOOL_ACCOUNTS_JSON_B64 }}
+        run: python -u scripts/gha_run.py

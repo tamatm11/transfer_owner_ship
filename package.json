@@ -1,0 +1,21 @@
+{
+  "name": "owner-video-tool-vercel",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "npm run build && node scripts/local-node-server.mjs",
+    "dev:vite": "npm --prefix web run dev",
+    "dev:vercel": "npx vercel dev",
+    "build": "npm --prefix web run build",
+    "typecheck": "npm --prefix web run typecheck",
+    "export:vercel-env": "node scripts/export-vercel-env.mjs",
+    "print:github-secrets": "node scripts/print-github-secrets.mjs"
+  },
+  "dependencies": {
+    "googleapis": "^173.0.0"
+  }
+}
