@@ -238,6 +238,9 @@ accounts = AccountManager()
 oauth_runs: dict[str, dict] = {}
 oauth_sessions: dict[str, dict] = {}
 oauth_lock = threading.RLock()
+# Maximum time to wait for the user to finish the Google login before the
+# session auto-fails, so a closed/abandoned tab never wedges the next attempt.
+OAUTH_WAIT_SECONDS = int(os.getenv("OWNER_TOOL_OAUTH_TIMEOUT", "300"))
 
 
 def public_account(item: Account, active: bool = False) -> dict:
@@ -277,7 +280,16 @@ def finish_oauth_session(oauth_id: str, session: dict) -> None:
     server = session["server"]
     callback = session["callback"]
     try:
-        server.handle_request()
+        # Poll in short slices instead of blocking forever, so we can react to a
+        # cancellation (user clicked add-account again) or an overall timeout.
+        server.timeout = 1
+        deadline = time.time() + OAUTH_WAIT_SECONDS
+        while not callback:
+            if session.get("cancelled"):
+                raise RuntimeError("Da huy phien dang nhap Google truoc do")
+            if time.time() > deadline:
+                raise RuntimeError("Het thoi gian cho dang nhap Google. Hay thu lai.")
+            server.handle_request()
         if callback.get("error"):
             raise RuntimeError(f"Google login failed: {callback['error']}")
         authorization_response = callback.get("authorization_response")
@@ -482,8 +494,16 @@ def begin_oauth(request: OAuthRequest) -> dict:
     if not CREDENTIALS.is_file():
         raise HTTPException(400, "credentials.json is missing")
     with oauth_lock:
-        if any(x["status"] in {"queued", "waiting_for_login"} for x in oauth_runs.values()):
-            raise HTTPException(409, "Another OAuth login is in progress")
+        # Supersede any in-flight login instead of rejecting: an abandoned tab
+        # would otherwise wedge every later attempt with a 409. Signal the old
+        # worker to stop and mark its run cancelled.
+        for rid, run in oauth_runs.items():
+            if run["status"] in {"queued", "waiting_for_login"}:
+                stale = oauth_sessions.get(rid)
+                if stale is not None:
+                    stale["cancelled"] = True
+                run.update(status="cancelled", message="Da bi thay the boi phien dang nhap moi",
+                    finished_at=now())
         oid = uuid.uuid4().hex
         oauth_runs[oid] = {"id": oid, "role": request.role, "status": "queued",
             "message": "Opening Google login", "email": None, "created_at": now(), "finished_at": None}
@@ -494,7 +514,8 @@ def begin_oauth(request: OAuthRequest) -> dict:
             oauth_runs.pop(oid, None)
         raise HTTPException(500, str(exc)) from exc
     with oauth_lock:
-        oauth_sessions[oid] = {"role": request.role, "flow": flow, "server": server, "callback": callback}
+        oauth_sessions[oid] = {"role": request.role, "flow": flow, "server": server,
+            "callback": callback, "cancelled": False}
         oauth_runs[oid].update(status="waiting_for_login", message="Open Google login in this browser",
             authorization_url=authorization_url, url=authorization_url)
     threading.Thread(target=oauth_worker, args=(oid, request.role), daemon=True).start()
