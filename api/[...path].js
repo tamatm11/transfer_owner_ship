@@ -556,6 +556,70 @@ async function findRun(jobId) {
   return runs.find(run => `${run.name || ''} ${run.display_title || ''}`.includes(jobId)) || null
 }
 
+// Cache parsed run logs briefly so 1.5s frontend polling doesn't hammer the
+// GitHub API or re-download the full job log on every tick.
+const LOG_CACHE_TTL_MS = 5000
+const logCache = globalThis.__ownerToolLogCache || new Map()
+globalThis.__ownerToolLogCache = logCache
+
+// Only these lines carry signal for the operator (per-item results, scan
+// progress, summaries, errors). Everything else (pip install, checkout, cache…)
+// is GitHub Actions setup noise and gets dropped.
+const LOG_KEEP = /^\[(OK|ERR|DRY|WARN|AUTH ERR|scan|skip)\]|^\$ |^Done\.|^Resolved |^Found |^Hoàn tất|^Owner Video Tool|transferred=|blocked=|unblocked=|failed=|Transfer .*->|->|^BLOCK |^UNBLOCK |Traceback|Exception/
+
+function cleanLogLine(line) {
+  let text = line.replace(/\r$/, '')
+  // Strip GitHub's leading ISO timestamp: 2024-06-29T12:00:00.1234567Z
+  text = text.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, '')
+  // Normalize GitHub workflow command markers (##[group], ##[error]…)
+  const marker = text.match(/^##\[(group|endgroup|command|error|warning|notice|debug|section)\](.*)$/)
+  if (marker) {
+    const [, kind, rest] = marker
+    if (kind === 'endgroup' || kind === 'debug') return null
+    if (kind === 'error') return `[ERR]  ${rest.trim()}`
+    if (kind === 'warning') return `[WARN] ${rest.trim()}`
+    return rest.trim() || null
+  }
+  return text
+}
+
+function extractRelevantLogs(text) {
+  const out = []
+  for (const raw of text.split('\n')) {
+    const line = cleanLogLine(raw)
+    if (line === null) continue
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    if (LOG_KEEP.test(trimmed)) out.push(trimmed)
+  }
+  return out.slice(-400)
+}
+
+// Fetch and parse the actual runner logs for a finished/running job. Uses the
+// per-job logs endpoint, which returns plain text (not a zip) so we can stream
+// the [OK]/[ERR]/… lines straight into the web log panel.
+async function githubRunLogs(runId, useCache = true) {
+  const cached = logCache.get(runId)
+  if (useCache && cached && Date.now() - cached.at < LOG_CACHE_TTL_MS) return cached.lines
+  try {
+    const jobsRes = await githubFetch(`/repos/${GITHUB_REPO}/actions/runs/${runId}/jobs`)
+    if (!jobsRes.ok) return cached?.lines || []
+    const jobsData = await jobsRes.json().catch(() => ({}))
+    const lines = []
+    for (const ghJob of jobsData.jobs || []) {
+      const logRes = await githubFetch(`/repos/${GITHUB_REPO}/actions/jobs/${ghJob.id}/logs`)
+      if (!logRes.ok) continue
+      const text = await logRes.text().catch(() => '')
+      if (text) lines.push(...extractRelevantLogs(text))
+    }
+    const result = lines.slice(-400)
+    logCache.set(runId, { at: Date.now(), lines: result })
+    return result
+  } catch {
+    return cached?.lines || []
+  }
+}
+
 async function githubJobStatus(jobId) {
   const run = await findRun(jobId)
   if (!run) {
@@ -564,6 +628,18 @@ async function githubJobStatus(jobId) {
   const status = mapRunStatus(run)
   const kindMatch = String(run.name || '').match(/owner-tool\s+(\w+)/)
   const progress = status === 'completed' ? 100 : status === 'running' ? 50 : status === 'queued' ? 10 : 100
+  // Force a fresh log pull once the run is done so the final poll (after which
+  // the frontend stops polling) always carries the complete [OK]/[ERR] output.
+  const detail = await githubRunLogs(run.id, run.status !== 'completed')
+  const header = [
+    `GitHub Actions run #${run.run_number} · ${status}`,
+    `Xem log trực tiếp tại: ${run.html_url}`,
+  ]
+  const logs = detail.length ? [...header, '──────── Log chi tiết ────────', ...detail] : header
+  const errorLines = detail.filter(line => /^\[(ERR|AUTH ERR|WARN)\]/.test(line))
+  const error = status === 'failed'
+    ? (errorLines.slice(-12).join('\n') || 'Job thất bại trên GitHub Actions. Mở link bên dưới để xem log đầy đủ.')
+    : undefined
   return {
     id: jobId,
     job_id: jobId,
@@ -576,10 +652,8 @@ async function githubJobStatus(jobId) {
     finished_at: run.status === 'completed' ? run.updated_at : undefined,
     progress,
     return_code: status === 'completed' ? 0 : status === 'failed' ? 1 : undefined,
-    logs: [
-      `GitHub Actions run #${run.run_number} · ${status}`,
-      `Xem log trực tiếp tại: ${run.html_url}`,
-    ],
+    logs,
+    error,
   }
 }
 
@@ -682,8 +756,15 @@ async function getBody(req) {
 
 export default async function handler(req, res) {
   try {
-    const rawPath = req.query.path || []
-    const parts = (Array.isArray(rawPath) ? rawPath : [rawPath]).filter(Boolean)
+    const rawPath = (req.query && req.query.path) || []
+    let parts = (Array.isArray(rawPath) ? rawPath : [rawPath]).filter(Boolean)
+    // On Vercel the catch-all `path` param isn't always injected into req.query
+    // (custom rewrites/functions config). Fall back to parsing req.url, which is
+    // always the real request path, so route matching never silently fails.
+    if (!parts.length) {
+      const urlPath = String(req.url || '').split('?')[0]
+      parts = urlPath.replace(/^\/+/, '').replace(/^api\/?/, '').split('/').filter(Boolean)
+    }
     const route = `/${parts.join('/')}`
 
     if (route === '/health') return json(res, 200, { ok: true, service: 'owner-video-tool-node' })
