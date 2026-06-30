@@ -52,7 +52,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from drive_common import FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE
-from protect_videos import _error_hint, is_video
+from protect_videos import _error_hint, is_blockable_file, is_video
 from transfer_ownership import (
     DriveItem,
     ItemOutcome,
@@ -120,24 +120,27 @@ def collect_transfer_items(
     recursive: bool,
     transfer_scope: str,
 ) -> list[DriveItem]:
-    """Collect videos and/or folders in a transfer-safe order.
+    """Collect files and/or folders in a transfer-safe order.
 
-    Videos are returned first. Folders are returned deepest-first so changing
-    ownership of a parent folder cannot interrupt traversal or child updates.
+    With scope ``videos`` only video files are selected; ``files`` selects every
+    non-folder file (Word, PDF, docx, …); ``all`` adds folders too. Files are
+    returned first. Folders are returned deepest-first so changing ownership of a
+    parent folder cannot interrupt traversal or child updates.
     """
-    include_videos = transfer_scope in {"videos", "all"}
+    include_files = transfer_scope in {"videos", "files", "all"}
     include_folders = transfer_scope in {"folders", "all"}
-    videos: list[DriveItem] = []
+    accept_file = is_video if transfer_scope == "videos" else is_blockable_file
+    files: list[DriveItem] = []
     folders_with_depth: list[tuple[int, DriveItem]] = []
-    seen_videos: set[str] = set()
+    seen_files: set[str] = set()
     seen_folders: set[str] = set()
 
     for folder_id in folder_ids:
         root = get_file(service, folder_id)
         if root.mime_type != FOLDER_MIME_TYPE:
-            if include_videos and is_video(root) and root.id not in seen_videos:
-                seen_videos.add(root.id)
-                videos.append(root)
+            if include_files and accept_file(root) and root.id not in seen_files:
+                seen_files.add(root.id)
+                files.append(root)
             continue
 
         queue: list[tuple[DriveItem, int]] = [(root, 0)]
@@ -150,7 +153,7 @@ def collect_transfer_items(
                 folders_with_depth.append((depth, folder))
 
             print(
-                f"[scan] {folder.name} - videos={len(videos)} "
+                f"[scan] {folder.name} - files={len(files)} "
                 f"folders={len(folders_with_depth)}",
                 flush=True,
             )
@@ -161,9 +164,9 @@ def collect_transfer_items(
                     continue
                 if child.mime_type == SHORTCUT_MIME_TYPE:
                     continue
-                if include_videos and is_video(child) and child.id not in seen_videos:
-                    seen_videos.add(child.id)
-                    videos.append(child)
+                if include_files and accept_file(child) and child.id not in seen_files:
+                    seen_files.add(child.id)
+                    files.append(child)
 
     folders = [
         item
@@ -176,8 +179,8 @@ def collect_transfer_items(
     if transfer_scope == "folders":
         return folders
     if transfer_scope == "all":
-        return videos + folders
-    return videos
+        return files + folders
+    return files
 
 
 def parse_args() -> argparse.Namespace:
@@ -222,9 +225,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--transfer-scope",
-        choices=("videos", "folders", "all"),
+        choices=("videos", "files", "folders", "all"),
         default="videos",
-        help="Transfer videos only, folders only, or both (default: videos).",
+        help=(
+            "Transfer videos only, all files (word/pdf/docx/…), folders only, "
+            "or everything (default: videos)."
+        ),
     )
     parser.add_argument(
         "--no-recursive",
@@ -317,11 +323,11 @@ def main() -> int:
     )
     if args.max_items is not None:
         items = items[: args.max_items]
-    video_count = sum(is_video(item) for item in items)
+    file_count = sum(item.mime_type != FOLDER_MIME_TYPE for item in items)
     folder_count = sum(item.mime_type == FOLDER_MIME_TYPE for item in items)
     print(
         f"Resolved {len(folder_ids)} folder(s). "
-        f"Selected {video_count} video(s), {folder_count} folder(s). "
+        f"Selected {file_count} file(s), {folder_count} folder(s). "
         f"scope={args.transfer_scope} mode={args.mode} "
         f"recursive={recursive} workers={workers} verify={args.verify} "
         f"dry_run={args.dry_run}"

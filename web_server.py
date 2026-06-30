@@ -211,7 +211,7 @@ class TransferRequest(BaseModel):
     owner_email: str
     rows: list[TransferRow] = Field(min_length=1)
     mode: Literal["consumer", "workspace"] = "consumer"
-    scope: Literal["videos", "folders", "all"] = "videos"
+    scope: Literal["videos", "files", "folders", "all"] = "videos"
     recursive: bool = True
     no_notify: bool = False
     dry_run: bool = False

@@ -19,7 +19,7 @@ export function TransferForm({ accounts, ownerEmail, busy, onSubmit }: { account
   const submit = () => onSubmit({ owner_email: ownerEmail, rows: rows.map(row => ({ folders: row.folders.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean), receiver_email: row.receiver_email })), mode, scope, recursive, no_notify: noNotify, verify, workers: Number(workers), dry_run: dryRun })
 
   return <div className="screen-form">
-    <div className="screen-heading"><div><h1>Chuyển ownership</h1><p>Chuyển quyền sở hữu video và thư mục Drive sang Account B.</p></div></div>
+    <div className="screen-heading"><div><h1>Chuyển ownership</h1><p>Chuyển quyền sở hữu video, file (word/pdf/docx…) và thư mục Drive sang Account B.</p></div></div>
     <Panel className="transfer-table">
       <div className="table-head"><span>Folder URLs / IDs</span><span>Account B nhận owner</span></div>
       {rows.map((row, index) => <div className="transfer-row" key={row.id}>
@@ -32,7 +32,7 @@ export function TransferForm({ accounts, ownerEmail, busy, onSubmit }: { account
     </Panel>
     <Panel className="settings-panel">
       <RadioGroup label="Chế độ" value={mode} onChange={value => { setMode(value); if (value === 'consumer') setNoNotify(false) }} options={[{ value: 'consumer', label: 'Consumer' }, { value: 'workspace', label: 'Workspace' }]} />
-      <RadioGroup label="Phạm vi" value={scope} onChange={setScope} options={[{ value: 'videos', label: 'Videos' }, { value: 'folders', label: 'Folders' }, { value: 'all', label: 'Tất cả' }]} />
+      <RadioGroup label="Phạm vi" value={scope} onChange={setScope} options={[{ value: 'videos', label: 'Videos' }, { value: 'files', label: 'Mọi file' }, { value: 'folders', label: 'Folders' }, { value: 'all', label: 'Tất cả' }]} />
       <RadioGroup label="Số luồng" value={workers} onChange={setWorkers} options={[{ value: '1', label: '1' }, { value: '4', label: '4' }, { value: '8', label: '8' }, { value: '16', label: '16' }]} />
       <Toggle label="Quét thư mục con" checked={recursive} onChange={setRecursive} />
       <Toggle label="Xác minh sau khi chuyển" checked={verify} onChange={setVerify} />

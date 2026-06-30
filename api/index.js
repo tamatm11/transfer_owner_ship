@@ -408,18 +408,19 @@ async function collectVideos(drive, folderIds, recursive, logs, accept = isVideo
 }
 
 async function collectTransferItems(drive, folderIds, recursive, scope, logs) {
-  const includeVideos = scope === 'videos' || scope === 'all'
+  const includeFiles = scope === 'videos' || scope === 'files' || scope === 'all'
   const includeFolders = scope === 'folders' || scope === 'all'
-  const videos = []
+  const acceptFile = scope === 'videos' ? isVideo : isBlockableFile
+  const files = []
   const folders = []
-  const seenVideos = new Set()
+  const seenFiles = new Set()
   const seenFolders = new Set()
   for (const folderId of folderIds) {
     const root = await getFile(drive, folderId)
     if (root.mimeType !== FOLDER_MIME) {
-      if (includeVideos && isVideo(root) && !seenVideos.has(root.id)) {
-        seenVideos.add(root.id)
-        videos.push(root)
+      if (includeFiles && acceptFile(root) && !seenFiles.has(root.id)) {
+        seenFiles.add(root.id)
+        files.push(root)
       }
       continue
     }
@@ -429,24 +430,24 @@ async function collectTransferItems(drive, folderIds, recursive, scope, logs) {
       if (seenFolders.has(folder.id)) continue
       seenFolders.add(folder.id)
       if (includeFolders) folders.push({ depth, item: folder })
-      logs.push(`[scan] ${folder.name} — videos=${videos.length} folders=${folders.length}`)
+      logs.push(`[scan] ${folder.name} — files=${files.length} folders=${folders.length}`)
       for (const child of await listChildren(drive, folder.id)) {
         if (child.mimeType === FOLDER_MIME) {
           if (recursive) queue.push({ item: child, depth: depth + 1 })
           continue
         }
         if (child.mimeType === SHORTCUT_MIME) continue
-        if (includeVideos && isVideo(child) && !seenVideos.has(child.id)) {
-          seenVideos.add(child.id)
-          videos.push(child)
+        if (includeFiles && acceptFile(child) && !seenFiles.has(child.id)) {
+          seenFiles.add(child.id)
+          files.push(child)
         }
       }
     }
   }
   const folderItems = folders.sort((a, b) => b.depth - a.depth).map(entry => entry.item)
   if (scope === 'folders') return folderItems
-  if (scope === 'all') return [...videos, ...folderItems]
-  return videos
+  if (scope === 'all') return [...files, ...folderItems]
+  return files
 }
 
 async function findPermission(drive, fileId, email) {
@@ -596,7 +597,7 @@ function buildTransferPayload(body) {
   return {
     owner_email: owner.email,
     mode: body.mode === 'workspace' ? 'workspace' : 'consumer',
-    scope: ['videos', 'folders', 'all'].includes(body.scope) ? body.scope : 'videos',
+    scope: ['videos', 'files', 'folders', 'all'].includes(body.scope) ? body.scope : 'videos',
     no_recursive: body.recursive === false,
     no_notify: Boolean(body.no_notify),
     dry_run: Boolean(body.dry_run),
@@ -796,9 +797,9 @@ async function handleTransfer(body) {
     const folderIds = (row.folders || []).map(extractFolderId)
     const acceptDrive = body.mode === 'consumer' && !body.dry_run ? driveFromToken(receiver.token) : null
     const items = await collectTransferItems(ownerDrive, folderIds, body.recursive !== false, body.scope || 'videos', logs)
-    const videoCount = items.filter(isVideo).length
+    const fileCount = items.filter(item => item.mimeType !== FOLDER_MIME).length
     const folderCount = items.filter(item => item.mimeType === FOLDER_MIME).length
-    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${videoCount} video(s), ${folderCount} folder(s). mode=${body.mode || 'consumer'} workers=${workers} verify=${verify} dry_run=${Boolean(body.dry_run)}`)
+    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${fileCount} file(s), ${folderCount} folder(s). scope=${body.scope || 'videos'} mode=${body.mode || 'consumer'} workers=${workers} verify=${verify} dry_run=${Boolean(body.dry_run)}`)
     await runPool(items, body.dry_run ? 1 : workers, async (item) => {
       const label = `${item.name} (${item.id})`
       if (body.dry_run) {
