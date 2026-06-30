@@ -1,50 +1,18 @@
-// Shared token store backed by a private GitHub Gist.
+// Shared encrypted account store backed by Upstash/Vercel KV REST.
 //
-// The gist holds a single file `accounts.json` with the bundle that both this
-// Vercel app and the GitHub Actions runner (gha_run.py) read at runtime:
+// The KV value is an encrypted envelope. The plaintext bundle has this shape:
 //
 //   { "version": 1, "active_a": "owner@gmail.com",
 //     "A": [{ "email", "display_name", "token_b64" }],
 //     "B": [{ "email", "display_name", "token_b64" }] }
 //
-// `token_b64` is base64 of the Google OAuth token JSON (same shape the Python
-// CLI's load_credentials expects). Storing the bundle in a gist — instead of a
-// static env var / GitHub secret — lets the web OAuth flow ADD accounts at
-// runtime without a redeploy or a manual secret update. GitHub secrets are
-// write-only (no read-back), so they cannot serve as the merge source; a gist
-// can be read and rewritten with the same PAT.
+// Keep OWNER_TOOL_STORE_KEY in Vercel + GitHub Actions secrets. The KV token
+// controls access to the value; the store key protects the Google refresh
+// tokens even if the KV data is accidentally exposed.
 
-const GIST_FILENAME = 'accounts.json'
-const GH_API = 'https://api.github.com'
+import crypto from 'node:crypto'
 
-function token() {
-  return (process.env.GH_API_TOKEN || process.env.GITHUB_DISPATCH_TOKEN || '').trim()
-}
-
-// Fine-grained PATs (prefix `github_pat_`) cannot write gists — GitHub rejects
-// the PATCH with 409 "Gist cannot be updated". Only classic PATs (prefix `ghp_`)
-// carrying the `gist` scope work. Detect the wrong kind up front so we fail with
-// a clear message instead of an opaque 409 after the round-trip.
-function tokenIsFineGrained() {
-  return token().startsWith('github_pat_')
-}
-
-function gistId() {
-  return (process.env.OWNER_TOOL_GIST_ID || '').trim()
-}
-
-export function storeConfigured() {
-  return Boolean(token() && gistId())
-}
-
-function ghHeaders() {
-  return {
-    Authorization: `Bearer ${token()}`,
-    Accept: 'application/vnd.github+json',
-    'X-GitHub-Api-Version': '2022-11-28',
-    'User-Agent': 'owner-video-tool',
-  }
-}
+const KV_KEY = 'owner-video-tool:accounts'
 
 function emptyBundle() {
   return { version: 1, active_a: '', A: [], B: [] }
@@ -60,65 +28,119 @@ function normalizeBundle(raw) {
   }
 }
 
-// Read the bundle from the gist. Returns null when the store isn't configured
-// (callers then fall back to the static env bundle).
-export async function readBundle() {
-  if (!storeConfigured()) return null
-  const res = await fetch(`${GH_API}/gists/${gistId()}`, { headers: ghHeaders() })
-  if (res.status === 404) return emptyBundle()
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    throw Object.assign(new Error(`Đọc gist token lỗi (${res.status}): ${text || 'unknown'}`), { status: 502 })
+function kvUrl() {
+  return (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '')
+}
+
+function writeToken() {
+  return (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '').trim()
+}
+
+function readToken() {
+  return (
+    writeToken()
+    || (process.env.KV_REST_API_READ_ONLY_TOKEN || process.env.UPSTASH_REDIS_REST_READONLY_TOKEN || '').trim()
+  )
+}
+
+function storeKey() {
+  return (process.env.OWNER_TOOL_STORE_KEY || process.env.OWNER_TOOL_KV_ENCRYPTION_KEY || '').trim()
+}
+
+function accountKey() {
+  return (process.env.OWNER_TOOL_KV_KEY || process.env.OWNER_TOOL_ACCOUNTS_KEY || KV_KEY).trim()
+}
+
+export function storeConfigured() {
+  return Boolean(kvUrl() && writeToken() && storeKey())
+}
+
+function assertStoreConfigured() {
+  if (!kvUrl() || !writeToken()) {
+    throw Object.assign(new Error('Chưa cấu hình KV_REST_API_URL + KV_REST_API_TOKEN trên Vercel.'), { status: 500 })
   }
-  const data = await res.json()
-  const file = data.files && data.files[GIST_FILENAME]
-  if (!file) return emptyBundle()
-  let content = file.content || ''
-  // Gist truncates files >1MB; fetch the raw URL in that (unlikely) case.
-  if (file.truncated && file.raw_url) {
-    content = await fetch(file.raw_url, { headers: ghHeaders() }).then(r => r.text())
-  }
-  if (!content.trim()) return emptyBundle()
-  try {
-    return normalizeBundle(JSON.parse(content))
-  } catch {
-    throw Object.assign(new Error('Nội dung gist token không phải JSON hợp lệ'), { status: 502 })
+  if (!storeKey()) {
+    throw Object.assign(new Error('Chưa cấu hình OWNER_TOOL_STORE_KEY để mã hóa token account.'), { status: 500 })
   }
 }
 
-// Persist the bundle back to the gist (full replace of accounts.json).
-export async function writeBundle(bundle) {
-  if (!storeConfigured()) {
-    throw Object.assign(new Error('Chưa cấu hình GH_API_TOKEN + OWNER_TOOL_GIST_ID'), { status: 500 })
-  }
-  if (tokenIsFineGrained()) {
-    throw Object.assign(new Error(
-      'GH_API_TOKEN đang là fine-grained token (github_pat_…) — GitHub không cho '
-      + 'loại token này ghi gist nên sẽ luôn lỗi 409. Hãy tạo classic PAT '
-      + '(https://github.com/settings/tokens) với scope `gist`, đặt lại GH_API_TOKEN '
-      + 'trên Vercel rồi redeploy.'
-    ), { status: 502 })
-  }
-  const body = JSON.stringify({
-    files: { [GIST_FILENAME]: { content: JSON.stringify(normalizeBundle(bundle), null, 2) + '\n' } },
+function encryptionKey() {
+  return crypto.createHash('sha256').update(storeKey(), 'utf8').digest()
+}
+
+function toBase64Url(buffer) {
+  return Buffer.from(buffer).toString('base64url')
+}
+
+function fromBase64Url(value) {
+  return Buffer.from(String(value || ''), 'base64url')
+}
+
+function encryptBundle(bundle) {
+  const iv = crypto.randomBytes(12)
+  const cipher = crypto.createCipheriv('aes-256-gcm', encryptionKey(), iv)
+  const plaintext = Buffer.from(JSON.stringify(normalizeBundle(bundle)), 'utf8')
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()])
+  return JSON.stringify({
+    version: 2,
+    encrypted: true,
+    algorithm: 'aes-256-gcm',
+    iv: toBase64Url(iv),
+    tag: toBase64Url(cipher.getAuthTag()),
+    data: toBase64Url(encrypted),
   })
-  const res = await fetch(`${GH_API}/gists/${gistId()}`, { method: 'PATCH', headers: { ...ghHeaders(), 'Content-Type': 'application/json' }, body })
-  if (!res.ok) {
-    const text = await res.text().catch(() => '')
-    // 409 "Gist cannot be updated": GitHub từ chối ghi gist. Các nguyên nhân,
-    // theo thứ tự phổ biến: (1) GH_API_TOKEN là fine-grained token (đã chặn ở
-    // trên), (2) classic PAT nhưng THIẾU scope `gist`, (3) token không thuộc tài
-    // khoản sở hữu gist OWNER_TOOL_GIST_ID.
-    if (res.status === 409) {
-      throw Object.assign(new Error(
-        'Ghi gist token lỗi (409): GitHub từ chối cập nhật gist. Kiểm tra: '
-        + '1) GH_API_TOKEN phải là classic PAT (ghp_…) có scope `gist`; '
-        + '2) token phải thuộc chính tài khoản sở hữu gist OWNER_TOOL_GIST_ID. '
-        + 'Tạo lại token tại https://github.com/settings/tokens rồi đặt lại trên Vercel và redeploy.'
-      ), { status: 502 })
-    }
-    throw Object.assign(new Error(`Ghi gist token lỗi (${res.status}): ${text || 'unknown'}`), { status: 502 })
+}
+
+function decryptBundle(raw) {
+  if (!raw) return emptyBundle()
+  const envelope = typeof raw === 'string' ? JSON.parse(raw) : raw
+  if (!envelope?.encrypted) {
+    throw Object.assign(new Error('KV account store chưa được mã hóa. Hãy chạy migration lại với OWNER_TOOL_STORE_KEY.'), { status: 500 })
   }
+  if (envelope.algorithm !== 'aes-256-gcm' || envelope.version !== 2) {
+    throw Object.assign(new Error('Định dạng KV account store không được hỗ trợ.'), { status: 500 })
+  }
+  const decipher = crypto.createDecipheriv('aes-256-gcm', encryptionKey(), fromBase64Url(envelope.iv))
+  decipher.setAuthTag(fromBase64Url(envelope.tag))
+  const decrypted = Buffer.concat([decipher.update(fromBase64Url(envelope.data)), decipher.final()])
+  return normalizeBundle(JSON.parse(decrypted.toString('utf8')))
+}
+
+async function kvCommand(command, args, token) {
+  const res = await fetch(kvUrl(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify([command, ...args]),
+  })
+  const text = await res.text()
+  let data = null
+  try {
+    data = text ? JSON.parse(text) : null
+  } catch {
+    data = { error: text }
+  }
+  if (!res.ok || data?.error) {
+    const detail = data?.error || text || 'unknown'
+    throw Object.assign(new Error(`KV ${command} lỗi (${res.status}): ${detail}`), { status: 502 })
+  }
+  return data?.result
+}
+
+// Read the encrypted bundle from KV. Returns null when KV isn't configured so
+// local/dev callers can still fall back to static env/local files.
+export async function readBundle() {
+  if (!kvUrl() || !readToken() || !storeKey()) return null
+  const value = await kvCommand('GET', [accountKey()], readToken())
+  return decryptBundle(value)
+}
+
+// Persist the encrypted bundle back to KV.
+export async function writeBundle(bundle) {
+  assertStoreConfigured()
+  await kvCommand('SET', [accountKey(), encryptBundle(bundle)], writeToken())
 }
 
 // Insert or replace an account (by role + email, case-insensitive). Returns the

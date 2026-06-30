@@ -1,14 +1,15 @@
 """GitHub Actions runner for Owner Video Tool jobs.
 
-Reads a job payload (JSON, from env GHA_JOB_PAYLOAD), decodes the Google OAuth
-token bundle (env OWNER_TOOL_ACCOUNTS_JSON_B64 — the same value used on Vercel),
-materializes each token to a temp file, then runs the existing CLI
+Reads a job payload (JSON, from env GHA_JOB_PAYLOAD), loads the encrypted Google
+OAuth token bundle from Upstash/Vercel KV, materializes each token to a temp file,
+then runs the existing CLI
 (auto_transfer_videos.py / protect_videos.py) once per row.
 
 Tokens never touch the repo: they are written to a temp dir that the runner VM
 discards when the job ends. stdout is streamed and captured by GitHub Actions.
 """
 import base64
+import hashlib
 import json
 import os
 import pathlib
@@ -18,63 +19,115 @@ import tempfile
 import urllib.error
 import urllib.request
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-GIST_FILENAME = "accounts.json"
+KV_KEY = "owner-video-tool:accounts"
 
 
 def log(message):
     print(message, flush=True)
 
 
-def load_bundle_from_gist():
-    """Fetch the live token bundle from the shared GitHub Gist.
+def _kv_url():
+    return (os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL") or "").strip().rstrip("/")
 
-    This is the same gist the Vercel web app writes to after each Google OAuth
-    login, so new accounts are picked up here with no secret update or redeploy.
-    Returns None when the gist store isn't configured (caller falls back).
-    """
-    gist_id = os.environ.get("OWNER_TOOL_GIST_ID", "").strip()
-    token = (os.environ.get("GH_API_TOKEN") or os.environ.get("GITHUB_DISPATCH_TOKEN") or "").strip()
-    if not gist_id or not token:
-        return None
+
+def _kv_token():
+    return (
+        os.environ.get("KV_REST_API_READ_ONLY_TOKEN")
+        or os.environ.get("UPSTASH_REDIS_REST_READONLY_TOKEN")
+        or os.environ.get("KV_REST_API_TOKEN")
+        or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+        or ""
+    ).strip()
+
+
+def _store_key():
+    return (os.environ.get("OWNER_TOOL_STORE_KEY") or os.environ.get("OWNER_TOOL_KV_ENCRYPTION_KEY") or "").strip()
+
+
+def _account_key():
+    return (os.environ.get("OWNER_TOOL_KV_KEY") or os.environ.get("OWNER_TOOL_ACCOUNTS_KEY") or KV_KEY).strip()
+
+
+def _b64url_decode(value):
+    raw = str(value or "").encode("utf-8")
+    raw += b"=" * (-len(raw) % 4)
+    return base64.urlsafe_b64decode(raw)
+
+
+def _decrypt_bundle(raw):
+    if not raw:
+        return {"version": 1, "active_a": "", "A": [], "B": []}
+    try:
+        envelope = json.loads(raw) if isinstance(raw, str) else raw
+        if not envelope.get("encrypted"):
+            raise ValueError("KV account store chưa được mã hóa.")
+        if envelope.get("version") != 2 or envelope.get("algorithm") != "aes-256-gcm":
+            raise ValueError("Định dạng KV account store không được hỗ trợ.")
+        key = hashlib.sha256(_store_key().encode("utf-8")).digest()
+        aesgcm = AESGCM(key)
+        plaintext = aesgcm.decrypt(
+            _b64url_decode(envelope.get("iv")),
+            _b64url_decode(envelope.get("data")) + _b64url_decode(envelope.get("tag")),
+            None,
+        )
+        bundle = json.loads(plaintext.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Không giải mã được KV account store: {exc}")
+    return {
+        "version": 1,
+        "active_a": str(bundle.get("active_a") or bundle.get("active_email") or "").strip(),
+        "A": bundle.get("A") if isinstance(bundle.get("A"), list) else [],
+        "B": bundle.get("B") if isinstance(bundle.get("B"), list) else [],
+    }
+
+
+def _kv_command(command, *args):
+    body = json.dumps([command, *args]).encode("utf-8")
     request = urllib.request.Request(
-        f"https://api.github.com/gists/{gist_id}",
+        _kv_url(),
+        data=body,
+        method="POST",
         headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "owner-video-tool",
+            "Authorization": f"Bearer {_kv_token()}",
+            "Content-Type": "application/json",
         },
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            data = json.loads(response.read().decode("utf-8"))
+            data = json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
-        raise SystemExit(f"Đọc gist token lỗi (HTTP {exc.code}).")
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"Đọc KV token lỗi (HTTP {exc.code}): {detail}")
     except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"Đọc gist token lỗi: {exc}")
-    file = (data.get("files") or {}).get(GIST_FILENAME)
-    if not file:
-        raise SystemExit(f"Gist {gist_id} không có file {GIST_FILENAME}.")
-    content = file.get("content") or ""
-    if file.get("truncated") and file.get("raw_url"):
-        with urllib.request.urlopen(file["raw_url"], timeout=30) as response:
-            content = response.read().decode("utf-8")
-    try:
-        return json.loads(content)
-    except Exception as exc:  # noqa: BLE001
-        raise SystemExit(f"Nội dung gist token không phải JSON hợp lệ: {exc}")
+        raise SystemExit(f"Đọc KV token lỗi: {exc}")
+    if data.get("error"):
+        raise SystemExit(f"Đọc KV token lỗi: {data['error']}")
+    return data.get("result")
+
+
+def load_bundle_from_kv():
+    """Fetch and decrypt the live token bundle from Upstash/Vercel KV.
+
+    Returns None when KV isn't configured so local/legacy setups can still use
+    OWNER_TOOL_ACCOUNTS_JSON_B64 as a fallback.
+    """
+    if not _kv_url() or not _kv_token() or not _store_key():
+        return None
+    return _decrypt_bundle(_kv_command("GET", _account_key()))
 
 
 def load_bundle():
-    bundle = load_bundle_from_gist()
+    bundle = load_bundle_from_kv()
     if bundle is not None:
-        log("Token bundle: đọc từ GitHub Gist.")
+        log("Token bundle: đọc từ encrypted KV store.")
         return bundle
     raw = os.environ.get("OWNER_TOOL_ACCOUNTS_JSON_B64", "").strip()
     if not raw:
-        raise SystemExit("Thiếu cả OWNER_TOOL_GIST_ID/GH_API_TOKEN lẫn OWNER_TOOL_ACCOUNTS_JSON_B64.")
+        raise SystemExit("Thiếu KV_REST_API_URL/KV token/OWNER_TOOL_STORE_KEY hoặc OWNER_TOOL_ACCOUNTS_JSON_B64 fallback.")
     try:
         log("Token bundle: đọc từ secret OWNER_TOOL_ACCOUNTS_JSON_B64 (fallback).")
         return json.loads(base64.b64decode(raw).decode("utf-8"))

@@ -52,9 +52,8 @@ jobs:
         env:
           GHA_JOB_KIND: ${{ inputs.kind }}
           GHA_JOB_PAYLOAD: ${{ inputs.payload }}
-          # Primary source: shared gist that the web OAuth flow writes to.
-          OWNER_TOOL_GIST_ID: ${{ secrets.OWNER_TOOL_GIST_ID }}
-          GH_API_TOKEN: ${{ secrets.GH_API_TOKEN }}
-          # Fallback for older setups without the gist store.
-          OWNER_TOOL_ACCOUNTS_JSON_B64: ${{ secrets.OWNER_TOOL_ACCOUNTS_JSON_B64 }}
+          # Primary source: encrypted Upstash/Vercel KV that the web OAuth flow writes to.
+          KV_REST_API_URL: ${{ secrets.KV_REST_API_URL }}
+          KV_REST_API_READ_ONLY_TOKEN: ${{ secrets.KV_REST_API_READ_ONLY_TOKEN }}
+          OWNER_TOOL_STORE_KEY: ${{ secrets.OWNER_TOOL_STORE_KEY }}
         run: python -u scripts/gha_run.py

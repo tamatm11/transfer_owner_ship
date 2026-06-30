@@ -1,87 +1,134 @@
-# Thêm tài khoản bằng Google OAuth (không cần push code)
+# Thêm tài khoản bằng Google OAuth với encrypted KV
 
-Trước đây mỗi lần thêm account phải login local → export → dán secret/env tay → redeploy.
-Giờ token nằm trong **một GitHub Gist dùng chung**; web app trên Vercel ghi vào gist sau
-khi bạn login Google, còn GitHub Actions đọc từ gist lúc chạy job. Thêm account =
-mở web → **Quản lý tài khoản → Kết nối** → login Google → xong.
+Tool không còn dùng GitHub Gist để lưu account. Web app ghi token Google OAuth vào
+Upstash/Vercel KV dưới dạng **mã hóa AES-256-GCM**; GitHub Actions chỉ đọc KV bằng
+read-only token rồi giải mã bằng `OWNER_TOOL_STORE_KEY`.
 
 ## Luồng hoạt động
 
-```
-Web (Vercel)  ──/api/oauth/start──▶ Google consent ──▶ /api/oauth/callback
-                                                              │ ghi token
-                                                              ▼
-                                                     GitHub Gist (accounts.json)
-                                                       ▲                    ▲
-                                          Vercel đọc ──┘                    └── GitHub Actions đọc
+```text
+Web (Vercel) -> /api/oauth/start -> Google consent -> /api/oauth/callback
+                                                        |
+                                                        | ghi encrypted bundle
+                                                        v
+                                                Upstash/Vercel KV
+                                                        ^
+                                                        | đọc read-only + giải mã
+                                                GitHub Actions
 ```
 
-File `accounts.json` trong gist:
+KV key mặc định:
 
-```json
-{
-  "version": 1,
-  "active_a": "owner@gmail.com",
-  "A": [{ "email": "owner@gmail.com", "display_name": "...", "token_b64": "<base64 token json>" }],
-  "B": [{ "email": "receiver@gmail.com", "display_name": "...", "token_b64": "..." }]
-}
+```text
+owner-video-tool:accounts
 ```
+
+Có thể đổi bằng `OWNER_TOOL_KV_KEY`.
 
 ## Setup 1 lần
 
 ### 1. Google OAuth client loại "Web application"
-- Google Cloud Console → APIs & Services → Credentials → **Create credentials → OAuth client ID**.
-- Application type: **Web application**.
-- **Authorized redirect URIs**: `https://<domain-vercel>/api/oauth/callback`
-  (thêm cả domain preview nếu cần, mỗi domain một dòng).
-- Bảo đảm OAuth consent screen đã bật scope `.../auth/drive`. Nếu app còn ở chế độ
-  "Testing", thêm các email A/B vào danh sách **Test users**.
-- Lưu lại **Client ID** và **Client secret**.
 
-### 2. GitHub Gist + PAT
-- Tạo **classic Personal Access Token** với scope **`gist`**
-  (token fine-grained hiện chưa hỗ trợ gist). Nếu token này cũng dùng để dispatch
-  workflow thì thêm scope `repo`/`workflow` như trước.
-- Tạo một **secret gist** mới (https://gist.github.com) với 1 file tên `accounts.json`
-  nội dung khởi tạo: `{ "version": 1, "active_a": "", "A": [], "B": [] }`.
-- Copy **gist id** (đoạn hash trong URL gist).
+- Google Cloud Console -> APIs & Services -> Credentials -> Create credentials -> OAuth client ID.
+- Application type: Web application.
+- Authorized redirect URIs: `https://<domain-vercel>/api/oauth/callback`.
+- Nếu app OAuth còn ở chế độ Testing, thêm email A/B vào Test users.
+- Lưu lại Client ID và Client secret.
 
-### 3. Biến môi trường trên Vercel
-Project Settings → Environment Variables (Production + Preview), rồi **Redeploy**:
+### 2. Tạo KV/Upstash trên Vercel
 
-| Biến | Giá trị |
-|------|---------|
-| `GOOGLE_WEB_CLIENT_ID` | Client ID ở bước 1 |
-| `GOOGLE_WEB_CLIENT_SECRET` | Client secret ở bước 1 |
-| `GH_API_TOKEN` | PAT có scope `gist` |
-| `OWNER_TOOL_GIST_ID` | gist id ở bước 2 |
+- Vercel project -> Storage/Marketplace -> Upstash Redis.
+- Lấy các biến:
+  - `KV_REST_API_URL`
+  - `KV_REST_API_TOKEN`
+  - `KV_REST_API_READ_ONLY_TOKEN`
 
-> `OWNER_TOOL_AUTH_SECRET` (đã có sẵn) được tái dùng để ký state OAuth — giữ nguyên.
-> Có thể đặt cả `GOOGLE_WEB_CREDENTIALS_JSON` (dán nguyên file client_secret JSON tải về)
-> thay cho 2 biến ID/SECRET nếu thích.
+Nếu dashboard dùng tên Upstash mới thì dùng cặp tương đương:
 
-### 4. Secret trên GitHub repo (cho Actions)
-Settings → Secrets and variables → Actions → New repository secret:
+```text
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+UPSTASH_REDIS_REST_READONLY_TOKEN
+```
 
-| Secret | Giá trị |
-|--------|---------|
-| `GH_API_TOKEN` | cùng PAT scope `gist` |
-| `OWNER_TOOL_GIST_ID` | cùng gist id |
+Code hiện tại hỗ trợ cả 2 nhóm tên.
 
-Secret cũ `OWNER_TOOL_ACCOUNTS_JSON_B64` vẫn để lại làm fallback; khi gist đã có
-account thì nó không còn được dùng.
+### 3. Tạo store key mã hóa
+
+Chạy local:
+
+```powershell
+node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
+```
+
+Copy output làm `OWNER_TOOL_STORE_KEY`. Giữ key này thật kỹ: mất key là không giải mã
+được account bundle trong KV.
+
+### 4. Biến môi trường trên Vercel
+
+Project Settings -> Environment Variables, thêm Production + Preview rồi redeploy:
+
+```text
+GOOGLE_WEB_CLIENT_ID
+GOOGLE_WEB_CLIENT_SECRET
+OWNER_TOOL_AUTH_SECRET
+OWNER_TOOL_ALLOWED_EMAIL
+OWNER_TOOL_PASSWORD_HASH
+OWNER_TOOL_STORE_KEY
+KV_REST_API_URL
+KV_REST_API_TOKEN
+KV_REST_API_READ_ONLY_TOKEN
+```
+
+Web cần `KV_REST_API_TOKEN` full quyền để thêm/xóa account.
+
+### 5. Secret trên GitHub Actions
+
+Repo -> Settings -> Secrets and variables -> Actions -> New repository secret:
+
+```text
+KV_REST_API_URL
+KV_REST_API_READ_ONLY_TOKEN
+OWNER_TOOL_STORE_KEY
+CREDENTIALS_JSON_B64          # tùy chọn
+```
+
+GitHub Actions chỉ cần read-only token vì runner không ghi account.
+
+## Migrate account cũ sang KV
+
+Nếu `.env.local` đang có `OWNER_TOOL_ACCOUNTS_JSON_B64`, hoặc máy local còn
+`account_a_accounts.json` / `account_b_accounts.json`, chạy:
+
+```powershell
+npm run migrate:kv
+```
+
+Script sẽ:
+
+- đọc bundle account cũ,
+- mã hóa bằng `OWNER_TOOL_STORE_KEY`,
+- ghi vào KV key `owner-video-tool:accounts`.
+
+Sau khi kiểm tra web đã thấy account A/B và GitHub Actions chạy được, có thể xóa:
+
+```text
+OWNER_TOOL_GIST_ID
+GH_API_TOKEN dùng riêng cho gist
+```
+
+Nếu `GH_API_TOKEN` trước đây cũng dùng để dispatch workflow, hãy thay bằng
+`GITHUB_DISPATCH_TOKEN` fine-grained chỉ có quyền Actions read/write cho repo này.
 
 ## Dùng hằng ngày
-1. Mở web app → **Quản lý tài khoản**.
-2. Bấm **Kết nối** ở Account A hoặc B → cửa sổ Google mở ra → chọn tài khoản → đồng ý.
-3. Cửa sổ tự đóng, danh sách account cập nhật. Token đã nằm trong gist — Vercel và
-   GitHub Actions dùng được ngay, **không cần push code hay sửa secret**.
 
-## Lưu ý
-- Google chỉ trả `refresh_token` ở lần consent đầu. Code đã ép `prompt=consent` nên
-  luôn lấy được; nếu vẫn thiếu, gỡ quyền tại https://myaccount.google.com/permissions
-  rồi kết nối lại.
-- Token trong gist là bí mật — luôn dùng **secret gist** (không public) và PAT riêng,
-  thu hồi được khi cần.
-- Bản local `web_server.py` vẫn dùng luồng loopback cũ và lưu token ra file local;
-  nó không tự đẩy lên gist. Trên production hãy thêm account qua web Vercel.
+1. Mở web app -> Quản lý tài khoản.
+2. Bấm Kết nối ở Account A hoặc B.
+3. Login Google và đồng ý quyền Drive.
+4. Token mới được merge vào encrypted KV store, không cần sửa GitHub secret hay redeploy.
+
+## Lưu ý bảo mật
+
+- Không dán KV token, `OWNER_TOOL_STORE_KEY`, refresh token Google vào chat/log/ticket.
+- Nếu token KV từng bị dán công khai, rotate token trong Upstash/Vercel ngay.
+- Nếu Gist cũ từng bị lộ URL, nên revoke Google OAuth permission rồi kết nối lại account.

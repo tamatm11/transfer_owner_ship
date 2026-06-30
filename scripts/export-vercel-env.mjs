@@ -21,6 +21,20 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(path.join(ROOT, file), 'utf8'))
 }
 
+function readEnvLocal() {
+  const file = path.join(ROOT, '.env.local')
+  const out = {}
+  if (!fs.existsSync(file)) return out
+  for (const line of fs.readFileSync(file, 'utf8').split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const i = trimmed.indexOf('=')
+    if (i <= 0) continue
+    out[trimmed.slice(0, i).trim()] = trimmed.slice(i + 1).trim().replace(/^"(.*)"$/, '$1')
+  }
+  return out
+}
+
 function loadRegistry(file) {
   const registry = readJson(file)
   return {
@@ -40,6 +54,8 @@ function loadRegistry(file) {
 
 const accountA = loadRegistry('account_a_accounts.json')
 const accountB = loadRegistry('account_b_accounts.json')
+const existingEnv = readEnvLocal()
+const storeKey = process.env.OWNER_TOOL_STORE_KEY || existingEnv.OWNER_TOOL_STORE_KEY || crypto.randomBytes(32).toString('base64url')
 const payload = {
   active_a: accountA.active_email,
   A: accountA.accounts,
@@ -53,6 +69,7 @@ const lines = [
   `OWNER_TOOL_ALLOWED_EMAIL=${allowedEmail}`,
   `OWNER_TOOL_PASSWORD_HASH=scrypt:${salt}:${key}`,
   `OWNER_TOOL_AUTH_SECRET=${crypto.randomBytes(32).toString('hex')}`,
+  `OWNER_TOOL_STORE_KEY=${storeKey}`,
   `OWNER_TOOL_ACCOUNTS_JSON_B64=${Buffer.from(JSON.stringify(payload), 'utf8').toString('base64')}`,
   '',
 ]

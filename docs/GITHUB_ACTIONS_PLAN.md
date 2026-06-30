@@ -1,5 +1,10 @@
 # Plan: Chạy job ngầm bằng GitHub Actions
 
+> Cập nhật: runtime hiện tại đọc account từ encrypted Upstash/Vercel KV
+> (`KV_REST_API_URL`, `KV_REST_API_READ_ONLY_TOKEN`, `OWNER_TOOL_STORE_KEY`).
+> Các đoạn bên dưới nhắc `OWNER_TOOL_ACCOUNTS_JSON_B64` chỉ còn là ghi chú legacy/fallback;
+> setup mới xem `docs/ADD_ACCOUNT_OAUTH.md`.
+
 Mục tiêu: bật tool trên web (Vercel) → out ra → GitHub Actions chạy transfer/block tới
 khi xong (tới 6h/job), độc lập với trình duyệt. Tái dùng nguyên CLI Python hiện có.
 

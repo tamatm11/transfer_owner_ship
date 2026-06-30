@@ -55,7 +55,7 @@ export default function App() {
   const connectAccount = (role: Role) => {
     setNotice('')
     // Redirect-based Google web OAuth. /api/oauth/start 302s to Google; after
-    // consent the server writes the token to the shared gist and sends the tab
+    // consent the server writes the token to the encrypted KV store and sends the tab
     // back to /?oauth=ok. We watch the popup land back on our origin, then close
     // it and refresh. If the popup is blocked, fall back to a full-page redirect.
     const url = `/api/oauth/start?role=${role}`

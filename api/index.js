@@ -210,25 +210,25 @@ function loadRegistry(registryFile) {
   return { accounts, active_email: data.active_email || '' }
 }
 
-// Pull the live bundle from the gist once per request and cache it on the
-// instance so the otherwise-sync loadAccounts() can read it. Falls back to the
-// static env bundle when the gist store isn't configured or is unreachable.
+// Pull the live bundle from KV once per request and cache it on the instance so
+// the otherwise-sync loadAccounts() can read it. Local/dev setups without KV
+// still fall back to static env/local files below.
 async function ensureStore() {
-  if (!storeConfigured()) return
-  try {
-    globalThis.__ownerToolBundle = await readBundle()
-  } catch {
-    // Keep whatever we had (env fallback handles a cold instance).
+  const bundle = await readBundle()
+  if (bundle === null) {
+    globalThis.__ownerToolStoreLoaded = false
+    return
   }
+  globalThis.__ownerToolBundle = bundle
+  globalThis.__ownerToolStoreLoaded = true
 }
 
 function loadAccounts() {
-  // Prefer the live gist bundle, but only once it actually holds an account —
-  // an empty gist (fresh setup) still falls back to the static env bundle so
-  // existing accounts keep working until the first OAuth add lands.
-  const gistBundle = globalThis.__ownerToolBundle
-  const gistHasAccounts = gistBundle && ((gistBundle.A && gistBundle.A.length) || (gistBundle.B && gistBundle.B.length))
-  const bundled = gistHasAccounts ? gistBundle : readJsonEnv('OWNER_TOOL_ACCOUNTS_JSON', 'OWNER_TOOL_ACCOUNTS_JSON_B64')
+  // When KV is configured, it is the source of truth even if it is empty. This
+  // avoids accidentally reviving stale token bundles from legacy env secrets.
+  const bundled = globalThis.__ownerToolStoreLoaded
+    ? globalThis.__ownerToolBundle
+    : readJsonEnv('OWNER_TOOL_ACCOUNTS_JSON', 'OWNER_TOOL_ACCOUNTS_JSON_B64')
   let activeA = ''
   let accountsA = []
   let accountsB = []
@@ -965,7 +965,7 @@ export default async function handler(req, res) {
 
     // Web OAuth: Google redirects back here with ?code&state. State (signed,
     // role-bearing, time-limited) is the CSRF guard; the captured token is
-    // merged into the shared gist bundle that Vercel + GitHub Actions both read.
+    // merged into the encrypted KV bundle that Vercel + GitHub Actions read.
     if (route === '/oauth/callback' && req.method === 'GET') {
       const params = new URL(req.url, 'http://x').searchParams
       const oauthError = params.get('error')
@@ -988,7 +988,7 @@ export default async function handler(req, res) {
     const user = verifySession(req)
     if (!user) return json(res, 401, { message: 'Vui lòng đăng nhập lại' })
 
-    // All routes below read accounts; refresh the gist-backed bundle first.
+    // All routes below read accounts; refresh the KV-backed bundle first.
     await ensureStore()
 
     if (route === '/accounts' && req.method === 'GET') {
@@ -1000,7 +1000,7 @@ export default async function handler(req, res) {
 
     if (route === '/accounts/oauth' && req.method === 'POST') {
       if (!oauthConfigured() || !storeConfigured()) {
-        return json(res, 501, { message: 'Chưa cấu hình OAuth web + gist store. Xem docs/ADD_ACCOUNT_OAUTH.md.' })
+        return json(res, 501, { message: 'Chưa cấu hình OAuth web + KV store. Xem docs/ADD_ACCOUNT_OAUTH.md.' })
       }
       const body = await getBody(req)
       const role = String(body.role || 'A').toUpperCase() === 'B' ? 'B' : 'A'
@@ -1013,8 +1013,8 @@ export default async function handler(req, res) {
       return json(res, 404, { message: 'OAuth web không dùng polling — đợi cửa sổ Google đóng lại.' })
     }
 
-    // Delete an account (A or B). Persisted to the shared gist so the GitHub
-    // Actions runner stops seeing it too. Requires the gist store — the static
+    // Delete an account (A or B). Persisted to the shared KV store so the GitHub
+    // Actions runner stops seeing it too. Requires KV — the static
     // env/local fallback bundle is read-only at runtime.
     if (parts[0] === 'accounts' && parts[1] && parts[2] && parts.length === 3 && req.method === 'DELETE') {
       const role = String(parts[1] || '').toUpperCase()
@@ -1023,7 +1023,7 @@ export default async function handler(req, res) {
       const account = findAccount(role, email)
       if (!account) return json(res, 404, { message: `Account ${role} không tồn tại: ${email}` })
       if (!storeConfigured()) {
-        return json(res, 501, { message: 'Xóa tài khoản cần gist store (đặt GH_API_TOKEN + OWNER_TOOL_GIST_ID).' })
+        return json(res, 501, { message: 'Xóa tài khoản cần KV store (đặt KV_REST_API_URL, KV_REST_API_TOKEN, OWNER_TOOL_STORE_KEY).' })
       }
       const bundle = removeAccount(globalThis.__ownerToolBundle || { version: 1, active_a: '', A: [], B: [] }, role, account.email)
       await writeBundle(bundle)
@@ -1041,7 +1041,7 @@ export default async function handler(req, res) {
       const account = findAccount('A', email)
       if (!account) return json(res, 404, { message: 'Account A not found' })
       globalThis.__ownerToolActiveA = account.email
-      // Persist the active choice to the gist so GitHub Actions sees it too.
+      // Persist the active choice to KV so GitHub Actions sees it too.
       if (storeConfigured()) {
         const bundle = { ...(globalThis.__ownerToolBundle || { version: 1, A: [], B: [] }), active_a: account.email }
         await writeBundle(bundle)

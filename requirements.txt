@@ -2,6 +2,7 @@ google-api-python-client==2.131.0
 google-auth==2.29.0
 google-auth-httplib2==0.2.0
 google-auth-oauthlib==1.2.0
+cryptography>=42,<45
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 # tkinter ships with the standard CPython installer on Windows (transfer_ui.py)

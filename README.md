@@ -24,7 +24,8 @@ Lệnh trên sẽ tạo `.env.local` gồm:
 - `OWNER_TOOL_ALLOWED_EMAIL=tamatm6713@gmail.com`
 - `OWNER_TOOL_PASSWORD_HASH=...` — hash mật khẩu, không lưu plain text.
 - `OWNER_TOOL_AUTH_SECRET=...`
-- `OWNER_TOOL_ACCOUNTS_JSON_B64=...` — Account A/B + token OAuth đã mã hóa base64 để đưa lên Vercel env.
+- `OWNER_TOOL_STORE_KEY=...` — key mã hóa encrypted KV store.
+- `OWNER_TOOL_ACCOUNTS_JSON_B64=...` — fallback/migration legacy; production nên dùng KV.
 
 `.env.local` chứa secret và đã được `.gitignore`, không commit file này.
 
@@ -59,7 +60,10 @@ Trong Vercel Dashboard, vào `Project Settings` → `Environment Variables`, cop
 OWNER_TOOL_ALLOWED_EMAIL
 OWNER_TOOL_PASSWORD_HASH
 OWNER_TOOL_AUTH_SECRET
-OWNER_TOOL_ACCOUNTS_JSON_B64
+OWNER_TOOL_STORE_KEY
+KV_REST_API_URL
+KV_REST_API_TOKEN
+KV_REST_API_READ_ONLY_TOKEN
 ```
 
 Deploy production:
@@ -72,6 +76,12 @@ Nếu muốn test đúng runtime Vercel CLI:
 
 ```powershell
 npm run dev:vercel
+```
+
+Nếu đang có account cũ trong `.env.local` hoặc file token local, migrate sang encrypted KV:
+
+```powershell
+npm run migrate:kv
 ```
 
 ## Chạy job ngầm bằng GitHub Actions (batch lớn 500+ video)
@@ -99,10 +109,12 @@ gh repo create owner-video-tool --private --source . --remote origin --push
 npm run print:github-secrets
 ```
 
-Lệnh in ra giá trị cho 2 secret. Vào repo → **Settings → Secrets and variables →
+Lệnh in ra giá trị secret KV/Actions. Vào repo → **Settings → Secrets and variables →
 Actions → New repository secret**:
 
-- `OWNER_TOOL_ACCOUNTS_JSON_B64` — bắt buộc (token A/B đã mã hóa).
+- `KV_REST_API_URL` — URL REST của Upstash/Vercel KV.
+- `KV_REST_API_READ_ONLY_TOKEN` — read-only token cho runner.
+- `OWNER_TOOL_STORE_KEY` — key giải mã account bundle.
 - `CREDENTIALS_JSON_B64` — tùy chọn (chỉ cần khi token B phải refresh bằng client config).
 
 ### 3. Tạo Personal Access Token (PAT)
@@ -126,17 +138,16 @@ Redeploy. Từ giờ bấm chạy trên web → Vercel gửi job sang GitHub Act
 `auto_transfer_videos.py`/`protect_videos.py` tới khi xong. Web hiện trạng thái và link
 "Xem log trực tiếp trên GitHub". Trình duyệt có thể đóng, job vẫn chạy.
 
-> Khi đổi/refresh token A hoặc B: chạy lại `npm run export:vercel-env -- --password "..."`,
-> rồi `npm run print:github-secrets` và cập nhật secret `OWNER_TOOL_ACCOUNTS_JSON_B64`
-> trên GitHub (và biến cùng tên trên Vercel nếu dùng).
+> Khi đổi/refresh token A hoặc B trên web, token được ghi thẳng vào encrypted KV store;
+> không cần cập nhật GitHub secret hay redeploy.
 
 ## Lưu ý quan trọng khi chạy trên Vercel
 
 - App đã có login riêng; chỉ email `tamatm6713@gmail.com` đăng nhập được.
 - API không trả token OAuth/token path ra browser.
-- Token Google Drive nằm trong Vercel Environment Variables, không nằm trong source.
+- Token Google Drive nằm trong encrypted KV store, không nằm trong source/Gist.
 - Vercel serverless phù hợp batch vừa/nhỏ. Job quá lớn có thể vượt giới hạn thời gian function; khi cần chạy batch rất dài, dùng bản local Python cũ hoặc chuyển backend sang server dài hạn/queue.
-- Tab `Tài khoản` trên bản Vercel không mở OAuth mới trong browser; muốn đổi account/token, chạy lại `npm run export:vercel-env -- --password "..."` rồi cập nhật env trên Vercel.
+- Tab `Tài khoản` trên bản Vercel mở OAuth Google và ghi account vào encrypted KV store.
 
 ## File chính
 
