@@ -312,10 +312,16 @@ function extractFolderId(value) {
 async function getFile(drive, fileId) {
   const { data } = await drive.files.get({
     fileId,
-    fields: 'id,name,mimeType,owners(emailAddress),copyRequiresWriterPermission',
+    fields: 'id,name,mimeType,owners(emailAddress),ownedByMe,copyRequiresWriterPermission',
     supportsAllDrives: true,
   })
-  return { id: data.id, name: data.name || data.id, mimeType: data.mimeType || '', owners: data.owners || [] }
+  return {
+    id: data.id,
+    name: data.name || data.id,
+    mimeType: data.mimeType || '',
+    owners: data.owners || [],
+    ownedByMe: typeof data.ownedByMe === 'boolean' ? data.ownedByMe : undefined,
+  }
 }
 
 async function listChildren(drive, folderId) {
@@ -324,7 +330,7 @@ async function listChildren(drive, folderId) {
   do {
     const { data } = await drive.files.list({
       q: `'${folderId.replace(/'/g, "\\'")}' in parents and trashed = false`,
-      fields: 'nextPageToken,files(id,name,mimeType)',
+      fields: 'nextPageToken,files(id,name,mimeType,owners(emailAddress),ownedByMe)',
       pageSize: 1000,
       pageToken,
       supportsAllDrives: true,
@@ -333,7 +339,31 @@ async function listChildren(drive, folderId) {
     items.push(...(data.files || []))
     pageToken = data.nextPageToken
   } while (pageToken)
-  return items.map(item => ({ id: item.id, name: item.name || item.id, mimeType: item.mimeType || '' }))
+  return items.map(item => ({
+    id: item.id,
+    name: item.name || item.id,
+    mimeType: item.mimeType || '',
+    owners: item.owners || [],
+    ownedByMe: typeof item.ownedByMe === 'boolean' ? item.ownedByMe : undefined,
+  }))
+}
+
+function ownerEmails(item) {
+  return (item.owners || [])
+    .map(owner => String(owner.emailAddress || '').trim())
+    .filter(Boolean)
+}
+
+function ownerSkipReason(item, expectedOwnerEmail, alreadyOwnerEmail) {
+  const expected = String(expectedOwnerEmail || '').trim().toLowerCase()
+  if (!expected) return ''
+  const owners = ownerEmails(item)
+  if (!owners.length) return ''
+  const lowered = owners.map(email => email.toLowerCase())
+  if (lowered.includes(expected)) return ''
+  const alreadyOwner = String(alreadyOwnerEmail || '').trim().toLowerCase()
+  if (alreadyOwner && lowered.includes(alreadyOwner)) return `already owned by target ${alreadyOwnerEmail}`
+  return `owner is ${owners.join(', ')}; expected ${expectedOwnerEmail}`
 }
 
 function isVideo(item) {
@@ -790,6 +820,7 @@ async function handleTransfer(body) {
   const workers = clampWorkers(body.workers)
   const verify = Boolean(body.verify)
   let success = 0
+  let skipped = 0
   let failed = 0
   for (const row of rows) {
     const receiver = accounts.B.find(item => item.email.toLowerCase() === String(row.receiver_email || '').toLowerCase())
@@ -799,9 +830,15 @@ async function handleTransfer(body) {
     const items = await collectTransferItems(ownerDrive, folderIds, body.recursive !== false, body.scope || 'videos', logs)
     const fileCount = items.filter(item => item.mimeType !== FOLDER_MIME).length
     const folderCount = items.filter(item => item.mimeType === FOLDER_MIME).length
-    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${fileCount} file(s), ${folderCount} folder(s). scope=${body.scope || 'videos'} mode=${body.mode || 'consumer'} workers=${workers} verify=${verify} dry_run=${Boolean(body.dry_run)}`)
+    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${fileCount} file(s), ${folderCount} folder(s). scope=${body.scope || 'videos'} mode=${body.mode || 'consumer'} workers=${workers} verify=${verify} owner_filter=${owner.email} dry_run=${Boolean(body.dry_run)}`)
     await runPool(items, body.dry_run ? 1 : workers, async (item) => {
       const label = `${item.name} (${item.id})`
+      const ownerReason = ownerSkipReason(item, owner.email, receiver.email)
+      if (ownerReason) {
+        skipped += 1
+        logs.push(`[SKIP] ${label}: ${ownerReason}`)
+        return
+      }
       if (body.dry_run) {
         success += 1
         logs.push(`[DRY]  ${label}`)
@@ -826,7 +863,7 @@ async function handleTransfer(body) {
       }
     })
   }
-  logs.push(`Done. transferred=${success}, failed=${failed}`)
+  logs.push(`Done. transferred=${success}, skipped=${skipped}, failed=${failed}`)
   return newJob('transfer', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
 }
 

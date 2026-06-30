@@ -65,8 +65,10 @@ from transfer_ownership import (
     ServiceFactory,
     build_drive_service,
     execute_with_retry,
+    get_authenticated_email,
     list_folder_children,
     get_file,
+    owner_skip_reason,
     run_item_batch,
     transfer_consumer_owner,
     transfer_workspace_owner,
@@ -188,10 +190,12 @@ def run_transfer(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+    expected_owner_email = get_authenticated_email(owner_service)
     videos = collect_videos(owner_service, args.folder_id, recursive=args.recursive)
     print(
         f"Found {len(videos)} video(s) across {len(args.folder_id)} folder(s). "
-        f"mode={args.mode} dry_run={args.dry_run}"
+        f"mode={args.mode} owner_filter={expected_owner_email or 'unknown'} "
+        f"dry_run={args.dry_run}"
     )
 
     success = skipped = failed = 0
@@ -199,6 +203,15 @@ def run_transfer(args: argparse.Namespace) -> int:
         if args.max_items is not None and index > args.max_items:
             break
         label = f"{item.name} ({item.id})"
+        owner_reason = owner_skip_reason(
+            item,
+            expected_owner_email,
+            already_owner_email=args.to_email,
+        )
+        if owner_reason:
+            skipped += 1
+            print(f"[SKIP] {label}: {owner_reason}")
+            continue
 
         if args.dry_run:
             success += 1

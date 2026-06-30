@@ -58,8 +58,10 @@ from transfer_ownership import (
     ItemOutcome,
     OAuthTokenError,
     ServiceFactory,
+    get_authenticated_email,
     get_file,
     list_folder_children,
+    owner_skip_reason,
     run_item_batch,
     transfer_consumer_owner,
     transfer_workspace_owner,
@@ -315,6 +317,7 @@ def main() -> int:
             )
 
     recursive = not args.no_recursive
+    expected_owner_email = get_authenticated_email(owner_service)
     items = collect_transfer_items(
         owner_service,
         folder_ids,
@@ -330,6 +333,7 @@ def main() -> int:
         f"Selected {file_count} file(s), {folder_count} folder(s). "
         f"scope={args.transfer_scope} mode={args.mode} "
         f"recursive={recursive} workers={workers} verify={args.verify} "
+        f"owner_filter={expected_owner_email or 'unknown'} "
         f"dry_run={args.dry_run}"
     )
 
@@ -337,6 +341,13 @@ def main() -> int:
 
     def process_one(item: DriveItem) -> ItemOutcome:
         label = f"{item.name} ({item.id})"
+        owner_reason = owner_skip_reason(
+            item,
+            expected_owner_email,
+            already_owner_email=args.to_email,
+        )
+        if owner_reason:
+            return ItemOutcome("skip", f"[SKIP] {label}: {owner_reason}")
         if args.dry_run:
             return ItemOutcome("ok", f"[DRY]  {label}")
         try:
@@ -373,7 +384,10 @@ def main() -> int:
         sleep_seconds=args.sleep,
     )
 
-    print(f"Done. transferred={counts['ok']}, failed={counts['fail']}")
+    print(
+        f"Done. transferred={counts['ok']}, "
+        f"skipped={counts['skip']}, failed={counts['fail']}"
+    )
     return 1 if counts["fail"] else 0
 
 

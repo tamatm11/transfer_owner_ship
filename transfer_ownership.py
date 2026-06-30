@@ -24,7 +24,7 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
@@ -72,6 +72,8 @@ class DriveItem:
     id: str
     name: str
     mime_type: str
+    owner_emails: tuple[str, ...] = ()
+    owned_by_me: bool | None = None
 
 
 class OAuthTokenError(RuntimeError):
@@ -377,6 +379,57 @@ def verify_owner(service: Any, file_id: str, email: str) -> bool:
     )
 
 
+def get_authenticated_email(service: Any) -> str:
+    """Return the email address behind the authenticated Drive service."""
+    user = execute_with_retry(service.about().get(fields="user(emailAddress)")).get("user", {})
+    return str(user.get("emailAddress", "")).strip()
+
+
+def _drive_item_from_payload(item: Mapping[str, Any]) -> DriveItem:
+    owners = tuple(
+        str(owner.get("emailAddress", "")).strip()
+        for owner in item.get("owners", []) or []
+        if str(owner.get("emailAddress", "")).strip()
+    )
+    owned_by_me = item.get("ownedByMe")
+    return DriveItem(
+        id=item["id"],
+        name=item.get("name", ""),
+        mime_type=item.get("mimeType", ""),
+        owner_emails=owners,
+        owned_by_me=bool(owned_by_me) if owned_by_me is not None else None,
+    )
+
+
+def describe_item_owners(item: DriveItem) -> str:
+    return ", ".join(item.owner_emails) if item.owner_emails else "unknown owner"
+
+
+def owner_skip_reason(
+    item: DriveItem,
+    expected_owner_email: str,
+    *,
+    already_owner_email: str | None = None,
+) -> str | None:
+    """Skip files whose current owner is not the selected source account.
+
+    If Drive does not return owner metadata, leave the item in the batch and let
+    the transfer API decide. This avoids false skips for unusual Drive items.
+    """
+    expected = expected_owner_email.strip().casefold()
+    if not expected:
+        return None
+    owners = {email.casefold() for email in item.owner_emails if email}
+    if not owners or expected in owners:
+        return None
+    already_owner = already_owner_email.strip().casefold() if already_owner_email else ""
+    if already_owner and already_owner in owners:
+        return f"already owned by target {already_owner_email}"
+    if owners:
+        return f"owner is {describe_item_owners(item)}; expected {expected_owner_email}"
+    return None
+
+
 @dataclass
 class ItemOutcome:
     """Result of processing one Drive item in a (possibly parallel) batch."""
@@ -436,16 +489,12 @@ def get_file(service: Any, file_id: str) -> DriveItem:
         service.files()
         .get(
             fileId=file_id,
-            fields="id,name,mimeType",
+            fields="id,name,mimeType,owners(emailAddress),ownedByMe",
             supportsAllDrives=True,
         )
         .execute()
     )
-    return DriveItem(
-        id=item["id"],
-        name=item.get("name", ""),
-        mime_type=item.get("mimeType", ""),
-    )
+    return _drive_item_from_payload(item)
 
 
 def list_folder_children(service: Any, folder_id: str) -> list[DriveItem]:
@@ -457,7 +506,7 @@ def list_folder_children(service: Any, folder_id: str) -> list[DriveItem]:
             service.files()
             .list(
                 q=f"'{folder_id}' in parents and trashed=false",
-                fields="nextPageToken,files(id,name,mimeType)",
+                fields="nextPageToken,files(id,name,mimeType,owners(emailAddress),ownedByMe)",
                 pageSize=1000,
                 pageToken=page_token,
                 includeItemsFromAllDrives=True,
@@ -466,13 +515,7 @@ def list_folder_children(service: Any, folder_id: str) -> list[DriveItem]:
             .execute()
         )
         for item in resp.get("files", []):
-            items.append(
-                DriveItem(
-                    id=item["id"],
-                    name=item.get("name", ""),
-                    mime_type=item.get("mimeType", ""),
-                )
-            )
+            items.append(_drive_item_from_payload(item))
         page_token = resp.get("nextPageToken")
         if not page_token:
             return items
@@ -687,6 +730,7 @@ def transfer_items(
     mode: str,
     owner_service: Any,
     accept_service: Any | None,
+    expected_owner_email: str,
     to_email: str,
     notify: bool,
     dry_run: bool,
@@ -707,6 +751,15 @@ def transfer_items(
         if skip_reason:
             skipped += 1
             print(f"[SKIP] {label}: {skip_reason}")
+            continue
+        owner_reason = owner_skip_reason(
+            item,
+            expected_owner_email,
+            already_owner_email=to_email,
+        )
+        if owner_reason:
+            skipped += 1
+            print(f"[SKIP] {label}: {owner_reason}")
             continue
 
         if dry_run:
@@ -837,14 +890,19 @@ def main() -> int:
                 file=sys.stderr,
             )
 
+    expected_owner_email = get_authenticated_email(owner_service)
     items = walk_items(owner_service, args.file_id, recursive=args.recursive)
-    print(f"Discovered {len(items)} item(s). Mode={args.mode}. Dry-run={args.dry_run}.")
+    print(
+        f"Discovered {len(items)} item(s). Mode={args.mode}. "
+        f"Owner filter={expected_owner_email or 'unknown'}. Dry-run={args.dry_run}."
+    )
 
     success, skipped, failed = transfer_items(
         items,
         mode=args.mode,
         owner_service=owner_service,
         accept_service=accept_service,
+        expected_owner_email=expected_owner_email,
         to_email=args.to_email,
         notify=not args.no_notify,
         dry_run=args.dry_run,
