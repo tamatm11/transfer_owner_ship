@@ -3,6 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { google } from 'googleapis'
+import { storeConfigured, readBundle, writeBundle, upsertAccount } from './_store.js'
+import { oauthConfigured, callbackUrl, signState, verifyState, buildAuthUrl, exchangeCode } from './_oauth.js'
 
 export const config = { api: { bodyParser: true } }
 
@@ -35,6 +37,17 @@ function json(res, status, payload) {
 
 function methodNotAllowed(res) {
   json(res, 405, { message: 'Method not allowed' })
+}
+
+function redirect(res, location) {
+  res.statusCode = 302
+  res.setHeader('Location', location)
+  res.end()
+}
+
+// Send the OAuth popup/tab back to the SPA with a status the frontend can read.
+function redirectToApp(res, query) {
+  redirect(res, `/?${query}`)
 }
 
 function readCookie(req, name) {
@@ -159,8 +172,25 @@ function loadRegistry(registryFile) {
   return { accounts, active_email: data.active_email || '' }
 }
 
+// Pull the live bundle from the gist once per request and cache it on the
+// instance so the otherwise-sync loadAccounts() can read it. Falls back to the
+// static env bundle when the gist store isn't configured or is unreachable.
+async function ensureStore() {
+  if (!storeConfigured()) return
+  try {
+    globalThis.__ownerToolBundle = await readBundle()
+  } catch {
+    // Keep whatever we had (env fallback handles a cold instance).
+  }
+}
+
 function loadAccounts() {
-  const bundled = readJsonEnv('OWNER_TOOL_ACCOUNTS_JSON', 'OWNER_TOOL_ACCOUNTS_JSON_B64')
+  // Prefer the live gist bundle, but only once it actually holds an account —
+  // an empty gist (fresh setup) still falls back to the static env bundle so
+  // existing accounts keep working until the first OAuth add lands.
+  const gistBundle = globalThis.__ownerToolBundle
+  const gistHasAccounts = gistBundle && ((gistBundle.A && gistBundle.A.length) || (gistBundle.B && gistBundle.B.length))
+  const bundled = gistHasAccounts ? gistBundle : readJsonEnv('OWNER_TOOL_ACCOUNTS_JSON', 'OWNER_TOOL_ACCOUNTS_JSON_B64')
   let activeA = ''
   let accountsA = []
   let accountsB = []
@@ -789,8 +819,44 @@ export default async function handler(req, res) {
       return json(res, 200, { ok: true })
     }
 
+    // Web OAuth: kick off Google login. Requires an app session (the user
+    // clicked "Connect" from the UI, so the Lax cookie rides the top-level GET).
+    if (route === '/oauth/start' && req.method === 'GET') {
+      if (!verifySession(req)) return json(res, 401, { message: 'Vui lòng đăng nhập lại' })
+      if (!oauthConfigured()) {
+        return json(res, 501, { message: 'Chưa cấu hình GOOGLE_WEB_CLIENT_ID/SECRET trên Vercel.' })
+      }
+      const role = String(new URL(req.url, 'http://x').searchParams.get('role') || 'A').toUpperCase() === 'B' ? 'B' : 'A'
+      return redirect(res, buildAuthUrl(callbackUrl(req), signState(role)))
+    }
+
+    // Web OAuth: Google redirects back here with ?code&state. State (signed,
+    // role-bearing, time-limited) is the CSRF guard; the captured token is
+    // merged into the shared gist bundle that Vercel + GitHub Actions both read.
+    if (route === '/oauth/callback' && req.method === 'GET') {
+      const params = new URL(req.url, 'http://x').searchParams
+      const oauthError = params.get('error')
+      if (oauthError) return redirectToApp(res, `oauth=error&reason=${encodeURIComponent(oauthError)}`)
+      const stateData = verifyState(params.get('state'))
+      const code = params.get('code')
+      if (!code || !stateData) return redirectToApp(res, 'oauth=error&reason=invalid_state')
+      try {
+        const account = await exchangeCode(callbackUrl(req), code)
+        await ensureStore()
+        const bundle = upsertAccount(globalThis.__ownerToolBundle || { version: 1, active_a: '', A: [], B: [] }, stateData.role, account)
+        await writeBundle(bundle)
+        globalThis.__ownerToolBundle = bundle
+        return redirectToApp(res, `oauth=ok&role=${stateData.role}&email=${encodeURIComponent(account.email)}`)
+      } catch (error) {
+        return redirectToApp(res, `oauth=error&reason=${encodeURIComponent(error.message || 'unknown')}`)
+      }
+    }
+
     const user = verifySession(req)
     if (!user) return json(res, 401, { message: 'Vui lòng đăng nhập lại' })
+
+    // All routes below read accounts; refresh the gist-backed bundle first.
+    await ensureStore()
 
     if (route === '/accounts' && req.method === 'GET') {
       const accounts = loadAccounts()
@@ -800,11 +866,18 @@ export default async function handler(req, res) {
     }
 
     if (route === '/accounts/oauth' && req.method === 'POST') {
-      return json(res, 501, { message: 'Bản Vercel dùng token trong Environment Variables. Hãy chạy npm run export:vercel-env trên máy local rồi thêm các biến env lên Vercel.' })
+      if (!oauthConfigured() || !storeConfigured()) {
+        return json(res, 501, { message: 'Chưa cấu hình OAuth web + gist store. Xem docs/ADD_ACCOUNT_OAUTH.md.' })
+      }
+      const body = await getBody(req)
+      const role = String(body.role || 'A').toUpperCase() === 'B' ? 'B' : 'A'
+      // The browser navigates to this same-origin URL, which 302s to Google.
+      return json(res, 200, { url: `/api/oauth/start?role=${role}`, redirect: true })
     }
 
-    if (parts[0] === 'oauth' && req.method === 'GET') {
-      return json(res, 404, { message: 'OAuth local không khả dụng trên bản Vercel' })
+    if (parts[0] === 'oauth' && parts[1] && req.method === 'GET') {
+      // Legacy local poll endpoint (/oauth/{id}); the web flow no longer polls.
+      return json(res, 404, { message: 'OAuth web không dùng polling — đợi cửa sổ Google đóng lại.' })
     }
 
     if (parts[0] === 'accounts' && parts[3] === 'activate' && req.method === 'POST') {
@@ -814,6 +887,12 @@ export default async function handler(req, res) {
       const account = findAccount('A', email)
       if (!account) return json(res, 404, { message: 'Account A not found' })
       globalThis.__ownerToolActiveA = account.email
+      // Persist the active choice to the gist so GitHub Actions sees it too.
+      if (storeConfigured()) {
+        const bundle = { ...(globalThis.__ownerToolBundle || { version: 1, A: [], B: [] }), active_a: account.email }
+        await writeBundle(bundle)
+        globalThis.__ownerToolBundle = bundle
+      }
       return json(res, 200, publicAccount(account, true))
     }
 

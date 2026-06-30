@@ -15,19 +15,68 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+GIST_FILENAME = "accounts.json"
 
 
 def log(message):
     print(message, flush=True)
 
 
+def load_bundle_from_gist():
+    """Fetch the live token bundle from the shared GitHub Gist.
+
+    This is the same gist the Vercel web app writes to after each Google OAuth
+    login, so new accounts are picked up here with no secret update or redeploy.
+    Returns None when the gist store isn't configured (caller falls back).
+    """
+    gist_id = os.environ.get("OWNER_TOOL_GIST_ID", "").strip()
+    token = (os.environ.get("GH_API_TOKEN") or os.environ.get("GITHUB_DISPATCH_TOKEN") or "").strip()
+    if not gist_id or not token:
+        return None
+    request = urllib.request.Request(
+        f"https://api.github.com/gists/{gist_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "owner-video-tool",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise SystemExit(f"Đọc gist token lỗi (HTTP {exc.code}).")
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Đọc gist token lỗi: {exc}")
+    file = (data.get("files") or {}).get(GIST_FILENAME)
+    if not file:
+        raise SystemExit(f"Gist {gist_id} không có file {GIST_FILENAME}.")
+    content = file.get("content") or ""
+    if file.get("truncated") and file.get("raw_url"):
+        with urllib.request.urlopen(file["raw_url"], timeout=30) as response:
+            content = response.read().decode("utf-8")
+    try:
+        return json.loads(content)
+    except Exception as exc:  # noqa: BLE001
+        raise SystemExit(f"Nội dung gist token không phải JSON hợp lệ: {exc}")
+
+
 def load_bundle():
+    bundle = load_bundle_from_gist()
+    if bundle is not None:
+        log("Token bundle: đọc từ GitHub Gist.")
+        return bundle
     raw = os.environ.get("OWNER_TOOL_ACCOUNTS_JSON_B64", "").strip()
     if not raw:
-        raise SystemExit("Thiếu secret OWNER_TOOL_ACCOUNTS_JSON_B64.")
+        raise SystemExit("Thiếu cả OWNER_TOOL_GIST_ID/GH_API_TOKEN lẫn OWNER_TOOL_ACCOUNTS_JSON_B64.")
     try:
+        log("Token bundle: đọc từ secret OWNER_TOOL_ACCOUNTS_JSON_B64 (fallback).")
         return json.loads(base64.b64decode(raw).decode("utf-8"))
     except Exception as exc:  # noqa: BLE001
         raise SystemExit(f"OWNER_TOOL_ACCOUNTS_JSON_B64 không hợp lệ: {exc}")

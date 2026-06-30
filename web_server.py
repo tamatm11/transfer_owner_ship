@@ -31,6 +31,11 @@ from auto_transfer_videos import extract_folder_id
 from drive_common import FOLDER_MIME_TYPE
 from transfer_ownership import SCOPES, build_drive_service, get_file, load_credentials
 
+# The OAuth callback runs on a loopback http://localhost address, which oauthlib
+# rejects ("OAuth 2 MUST utilize https") unless this flag is set. Loopback http is
+# the standard, safe redirect for installed-app OAuth, so allow it explicitly.
+os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
+
 ROOT = Path(__file__).resolve().parent
 WEB_DIST = ROOT / "web" / "dist"
 CREDENTIALS = ROOT / "credentials.json"

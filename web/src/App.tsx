@@ -36,50 +36,40 @@ export default function App() {
       .finally(() => setAuthReady(true))
   }, [refreshAccounts])
   useEffect(() => {
+    // Handle the full-page-redirect fallback: Google sent us back to /?oauth=…
+    const params = new URLSearchParams(window.location.search)
+    const status = params.get('oauth')
+    if (!status) return
+    if (status === 'ok') setNotice(`Đã kết nối ${params.get('email') || 'tài khoản'} (vai trò ${params.get('role') || ''}).`)
+    else setNotice(`Kết nối Google thất bại: ${params.get('reason') || 'unknown'}`)
+    window.history.replaceState({}, '', window.location.pathname)
+    refreshAccounts()
+  }, [refreshAccounts])
+  useEffect(() => {
     if (!job?.id || !['queued', 'running'].includes(job.status || '')) return
     const timer = window.setInterval(async () => { try { const next = await api.job(job.id); setJob(prev => prev ? { ...prev, ...next } : next); setJobs(all => all.map(item => item.id === next.id ? { ...item, ...next } : item)) } catch (error) { setNotice((error as Error).message) } }, 1500)
     return () => window.clearInterval(timer)
   }, [job?.id, job?.status])
 
   const startJob = async (kind: 'transfer' | 'block', payload: unknown) => { setLoading(true); setNotice(''); try { const next = kind === 'transfer' ? await api.startTransfer(payload) : await api.startBlock(payload); const normalized = { ...next, type: next.type || kind }; setJob(normalized); setJobs(all => [normalized, ...all.filter(item => item.id !== normalized.id)]); setLogsOpen(true) } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
-  const connectAccount = async (role: Role) => {
-    const authWindow = window.open('', '_blank')
-    setLoading(true)
+  const connectAccount = (role: Role) => {
     setNotice('')
-    try {
-      const result = await api.oauth(role)
-      const id = result.id || result.oauth_id
-      const url = result.url || result.authorization_url
-      if (url) {
-        if (authWindow && !authWindow.closed) {
-          try { authWindow.opener = null } catch {}
-          authWindow.location.href = url
-        } else {
-          const opened = window.open(url, '_blank', 'noopener,noreferrer')
-          if (!opened) window.location.assign(url)
-        }
-      } else {
-        authWindow?.close()
-      }
-      if (id) {
-        const timer = window.setInterval(async () => {
-          const status = await api.oauthStatus(id).catch(() => null)
-          if (status && ['completed', 'success', 'succeeded', 'connected'].includes(String(status.status))) {
-            window.clearInterval(timer)
-            refreshAccounts()
-          } else if (status?.status === 'failed') {
-            window.clearInterval(timer)
-            setNotice(String(status.error || status.message || 'Không thể kết nối tài khoản'))
-          }
-        }, 1000)
-        window.setTimeout(() => window.clearInterval(timer), 120000)
-      }
-    } catch (error) {
-      authWindow?.close()
-      setNotice((error as Error).message)
-    } finally {
-      setLoading(false)
-    }
+    // Redirect-based Google web OAuth. /api/oauth/start 302s to Google; after
+    // consent the server writes the token to the shared gist and sends the tab
+    // back to /?oauth=ok. We watch the popup land back on our origin, then close
+    // it and refresh. If the popup is blocked, fall back to a full-page redirect.
+    const url = `/api/oauth/start?role=${role}`
+    const popup = window.open(url, 'owner_tool_oauth', 'width=520,height=680')
+    if (!popup) { window.location.assign(url); return }
+    const timer = window.setInterval(() => {
+      let done = false
+      try {
+        if (popup.closed) done = true
+        else if (popup.location.search.includes('oauth=')) { done = true; popup.close() }
+      } catch { /* still on accounts.google.com (cross-origin) — keep waiting */ }
+      if (done) { window.clearInterval(timer); refreshAccounts() }
+    }, 800)
+    window.setTimeout(() => window.clearInterval(timer), 180000)
   }
   const activate = async (account: Account) => { try { await api.activate(account.role, account.email); await refreshAccounts() } catch (error) { setNotice((error as Error).message) } }
   const stop = async () => { if (!job?.id) return; try { const next = await api.stop(job.id); setJob(next); setJobs(all => all.map(item => item.id === next.id ? next : item)) } catch (error) { setNotice((error as Error).message) } }

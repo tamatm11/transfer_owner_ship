@@ -13,7 +13,10 @@ Supports two Google Drive ownership flows:
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import socket
+import ssl
 import sys
 import time
 from collections.abc import Iterable
@@ -21,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from google.auth.exceptions import RefreshError
+from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -37,6 +40,29 @@ SCOPES = ["https://www.googleapis.com/auth/drive"]
 
 # Transient Drive errors worth retrying with backoff (rate limits / server hiccups).
 RETRYABLE_STATUS = {429, 500, 502, 503}
+
+# Transient transport failures worth retrying. These surface from
+# request.execute() — INCLUDING the implicit OAuth token refresh that runs just
+# before the HTTP call — and are not HttpError, so they must be caught
+# separately. ssl.SSLEOFError ("EOF occurred in violation of protocol") is a
+# subclass of ssl.SSLError; ConnectionError/socket.timeout cover resets and
+# timeouts; httplib2 raises http.client.HTTPException for dropped responses.
+RETRYABLE_NETWORK_ERRORS: tuple[type[BaseException], ...] = (
+    ssl.SSLError,
+    socket.timeout,
+    socket.gaierror,
+    ConnectionError,
+    http.client.HTTPException,
+    TimeoutError,
+    TransportError,
+)
+
+try:  # httplib2 transport errors (used under the hood by google-api-python-client)
+    from httplib2 import HttpLib2Error
+
+    RETRYABLE_NETWORK_ERRORS += (HttpLib2Error,)
+except Exception:  # noqa: BLE001 - httplib2 always present, but stay defensive
+    pass
 
 
 @dataclass
@@ -65,6 +91,34 @@ def _http_status(exc: HttpError) -> int | None:
         return None
 
 
+def _sleep_backoff(attempt: int, retries: int, base_delay: float, reason: str) -> None:
+    delay = base_delay * (2 ** attempt)
+    print(
+        f"[retry] {reason}; attempt {attempt + 1}/{retries}, waiting {delay:.0f}s",
+        file=sys.stderr,
+        flush=True,
+    )
+    time.sleep(delay)
+
+
+def _refresh_credentials(creds: Credentials, *, retries: int = 4, base_delay: float = 2.0) -> None:
+    """Refresh an access token, retrying transient network/SSL failures.
+
+    A RefreshError (e.g. invalid_grant) is permanent and re-raised immediately;
+    only transport-level drops like SSLEOFError are retried.
+    """
+    for attempt in range(retries + 1):
+        try:
+            creds.refresh(Request())
+            return
+        except RefreshError:
+            raise
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            if attempt == retries:
+                raise
+            _sleep_backoff(attempt, retries, base_delay, f"refresh {type(exc).__name__}: {exc}")
+
+
 def execute_with_retry(
     request: Any,
     *,
@@ -85,14 +139,15 @@ def execute_with_retry(
             retryable = status in RETRYABLE_STATUS or (retry_404 and status == 404)
             if not retryable or attempt == retries:
                 raise
-            delay = base_delay * (2 ** attempt)
-            print(
-                f"[retry] HTTP {status}; attempt {attempt + 1}/{retries}, "
-                f"waiting {delay:.0f}s",
-                file=sys.stderr,
-                flush=True,
+            _sleep_backoff(attempt, retries, base_delay, f"HTTP {status}")
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            # Transient network/SSL drop (e.g. SSLEOFError during token refresh,
+            # connection reset). Retrying the request re-runs the refresh too.
+            if attempt == retries:
+                raise
+            _sleep_backoff(
+                attempt, retries, base_delay, f"{type(exc).__name__}: {exc}"
             )
-            time.sleep(delay)
 
 
 def _token_refresh_error_message(exc: RefreshError) -> str:
@@ -122,9 +177,15 @@ def load_credentials(token_path: str) -> Credentials:
 
     if not creds.valid and creds.expired and creds.refresh_token:
         try:
-            creds.refresh(Request())
+            _refresh_credentials(creds)
         except RefreshError as exc:
             raise OAuthTokenError(token_path, _token_refresh_error_message(exc)) from exc
+        except RETRYABLE_NETWORK_ERRORS as exc:
+            raise OAuthTokenError(
+                token_path,
+                f"Network error while refreshing token ({type(exc).__name__}): {exc}. "
+                "This is usually transient — re-run the job.",
+            ) from exc
         info.update(
             {
                 "token": creds.token,
