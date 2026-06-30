@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import re
 import sys
-import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -56,12 +55,15 @@ from drive_common import FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE
 from protect_videos import _error_hint, is_video
 from transfer_ownership import (
     DriveItem,
+    ItemOutcome,
     OAuthTokenError,
-    build_drive_service,
+    ServiceFactory,
     get_file,
     list_folder_children,
+    run_item_batch,
     transfer_consumer_owner,
     transfer_workspace_owner,
+    verify_owner,
 )
 
 
@@ -237,8 +239,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sleep",
         type=float,
-        default=1.0,
-        help="Seconds to wait between API calls (default: 1.0).",
+        default=0.0,
+        help=(
+            "Seconds each worker waits after every API call to respect rate "
+            "limits (default: 0.0; raise if you hit HTTP 429)."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel transfer threads (default: 4, max 16).",
+    )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="After each transfer, confirm account B is the real owner.",
     )
     parser.add_argument(
         "--no-notify",
@@ -257,10 +273,11 @@ def main() -> int:
     args = parse_args()
 
     folder_ids = parse_folder_list(args.folders)
+    workers = max(1, min(args.workers, 16))
     try:
-        owner_service = build_drive_service(args.owner_token)
-        accept_service = (
-            build_drive_service(
+        owner_factory = ServiceFactory(args.owner_token)
+        accept_factory = (
+            ServiceFactory(
                 args.accept_token,
                 reauth=args.reauth_accept_token,
                 credentials_path=args.credentials,
@@ -272,6 +289,9 @@ def main() -> int:
     except OAuthTokenError as exc:
         print(f"[AUTH ERR] {exc}", file=sys.stderr)
         return 2
+
+    owner_service = owner_factory.primary
+    accept_service = accept_factory.primary if accept_factory else None
 
     if args.mode == "consumer" and accept_service is None:
         if args.dry_run:
@@ -295,50 +315,60 @@ def main() -> int:
         recursive=recursive,
         transfer_scope=args.transfer_scope,
     )
+    if args.max_items is not None:
+        items = items[: args.max_items]
     video_count = sum(is_video(item) for item in items)
     folder_count = sum(item.mime_type == FOLDER_MIME_TYPE for item in items)
     print(
         f"Resolved {len(folder_ids)} folder(s). "
         f"Selected {video_count} video(s), {folder_count} folder(s). "
         f"scope={args.transfer_scope} mode={args.mode} "
-        f"recursive={recursive} dry_run={args.dry_run}"
+        f"recursive={recursive} workers={workers} verify={args.verify} "
+        f"dry_run={args.dry_run}"
     )
 
-    success = failed = 0
-    for index, item in enumerate(items, start=1):
-        if args.max_items is not None and index > args.max_items:
-            break
+    notify = not args.no_notify
+
+    def process_one(item: DriveItem) -> ItemOutcome:
         label = f"{item.name} ({item.id})"
-
         if args.dry_run:
-            success += 1
-            print(f"[DRY]  {label}")
-            continue
-
+            return ItemOutcome("ok", f"[DRY]  {label}")
         try:
             if args.mode == "workspace":
                 transfer_workspace_owner(
-                    owner_service, item.id, args.to_email, notify=not args.no_notify
+                    owner_factory.get(), item.id, args.to_email, notify=notify
                 )
+                check_service = owner_factory.get()
             else:
                 transfer_consumer_owner(
-                    owner_service,
-                    accept_service,
+                    owner_factory.get(),
+                    accept_factory.get() if accept_factory else None,
                     item,
                     args.to_email,
-                    notify=not args.no_notify,
+                    notify=notify,
                 )
-            success += 1
-            print(f"[OK]   {label}")
+                check_service = (
+                    accept_factory.get() if accept_factory else owner_factory.get()
+                )
+            if args.verify and not verify_owner(check_service, item.id, args.to_email):
+                return ItemOutcome(
+                    "fail",
+                    f"[ERR]  {label}: verify failed — {args.to_email} is not the "
+                    f"confirmed owner yet",
+                )
+            return ItemOutcome("ok", f"[OK]   {label}")
         except HttpError as exc:
-            failed += 1
-            print(f"[ERR]  {label}: {exc}{_error_hint(exc)}", file=sys.stderr)
+            return ItemOutcome("fail", f"[ERR]  {label}: {exc}{_error_hint(exc)}")
 
-        if args.sleep > 0:
-            time.sleep(args.sleep)
+    counts = run_item_batch(
+        items,
+        process_one,
+        workers=1 if args.dry_run else workers,
+        sleep_seconds=args.sleep,
+    )
 
-    print(f"Done. transferred={success}, failed={failed}")
-    return 1 if failed else 0
+    print(f"Done. transferred={counts['ok']}, failed={counts['fail']}")
+    return 1 if counts["fail"] else 0
 
 
 if __name__ == "__main__":

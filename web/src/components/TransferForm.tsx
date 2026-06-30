@@ -11,10 +11,12 @@ export function TransferForm({ accounts, ownerEmail, busy, onSubmit }: { account
   const [scope, setScope] = useState('videos')
   const [recursive, setRecursive] = useState(true)
   const [noNotify, setNoNotify] = useState(false)
+  const [verify, setVerify] = useState(false)
+  const [workers, setWorkers] = useState('4')
   const [dryRun, setDryRun] = useState(false)
   const receivers = useMemo(() => accounts.filter(a => a.role === 'B'), [accounts])
   const update = (id: string, patch: Partial<TransferRow>) => setRows(value => value.map(row => row.id === id ? { ...row, ...patch } : row))
-  const submit = () => onSubmit({ owner_email: ownerEmail, rows: rows.map(row => ({ folders: row.folders.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean), receiver_email: row.receiver_email })), mode, scope, recursive, no_notify: noNotify, dry_run: dryRun })
+  const submit = () => onSubmit({ owner_email: ownerEmail, rows: rows.map(row => ({ folders: row.folders.split(/\r?\n|,/).map(v => v.trim()).filter(Boolean), receiver_email: row.receiver_email })), mode, scope, recursive, no_notify: noNotify, verify, workers: Number(workers), dry_run: dryRun })
 
   return <div className="screen-form">
     <div className="screen-heading"><div><h1>Chuyển ownership</h1><p>Chuyển quyền sở hữu video và thư mục Drive sang Account B.</p></div></div>
@@ -31,7 +33,9 @@ export function TransferForm({ accounts, ownerEmail, busy, onSubmit }: { account
     <Panel className="settings-panel">
       <RadioGroup label="Chế độ" value={mode} onChange={value => { setMode(value); if (value === 'consumer') setNoNotify(false) }} options={[{ value: 'consumer', label: 'Consumer' }, { value: 'workspace', label: 'Workspace' }]} />
       <RadioGroup label="Phạm vi" value={scope} onChange={setScope} options={[{ value: 'videos', label: 'Videos' }, { value: 'folders', label: 'Folders' }, { value: 'all', label: 'Tất cả' }]} />
+      <RadioGroup label="Số luồng" value={workers} onChange={setWorkers} options={[{ value: '1', label: '1' }, { value: '4', label: '4' }, { value: '8', label: '8' }, { value: '16', label: '16' }]} />
       <Toggle label="Quét thư mục con" checked={recursive} onChange={setRecursive} />
+      <Toggle label="Xác minh sau khi chuyển" checked={verify} onChange={setVerify} />
       <Toggle label="Không gửi email (Workspace)" checked={noNotify} onChange={setNoNotify} disabled={mode === 'consumer'} />
       <Toggle label="Chạy thử" checked={dryRun} onChange={setDryRun} />
     </Panel>

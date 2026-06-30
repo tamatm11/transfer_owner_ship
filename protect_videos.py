@@ -42,7 +42,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 # Windows consoles default to cp1252, which cannot encode Vietnamese file names
@@ -60,11 +60,14 @@ if __package__ in (None, ""):
 from drive_common import FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE
 from transfer_ownership import (
     DriveItem,
+    ItemOutcome,
     OAuthTokenError,
+    ServiceFactory,
     build_drive_service,
     execute_with_retry,
     list_folder_children,
     get_file,
+    run_item_batch,
     transfer_consumer_owner,
     transfer_workspace_owner,
     _http_status,
@@ -89,28 +92,39 @@ def is_video(item: DriveItem) -> bool:
     return item.mime_type.startswith("video/")
 
 
+def is_blockable_file(item: DriveItem) -> bool:
+    """True for any real, downloadable file (not a folder or shortcut).
+
+    Used by ``block --all-files`` so PDFs, slides and other course material get
+    the same download/copy/print restriction as the videos.
+    """
+    return item.mime_type not in (FOLDER_MIME_TYPE, SHORTCUT_MIME_TYPE)
+
+
 def collect_videos(
     service,
     folder_ids: Iterable[str],
     *,
     recursive: bool,
+    accept: Callable[[DriveItem], bool] = is_video,
 ) -> list[DriveItem]:
-    """Return every video file inside the given folders.
+    """Return every matching file inside the given folders.
 
+    ``accept`` decides which files are collected (videos only by default).
     Each folder id is walked breadth-first when recursive=True. Shortcuts and
-    sub-folders are traversed for discovery but never returned as videos.
+    sub-folders are traversed for discovery but never collected themselves.
     """
-    videos: list[DriveItem] = []
-    seen_video_ids: set[str] = set()
+    matches: list[DriveItem] = []
+    seen_ids: set[str] = set()
     visited_folders: set[str] = set()
 
     for folder_id in folder_ids:
         root = get_file(service, folder_id)
         if root.mime_type != FOLDER_MIME_TYPE:
-            # Caller pointed directly at a file; include it if it is a video.
-            if is_video(root) and root.id not in seen_video_ids:
-                seen_video_ids.add(root.id)
-                videos.append(root)
+            # Caller pointed directly at a file; include it if it matches.
+            if accept(root) and root.id not in seen_ids:
+                seen_ids.add(root.id)
+                matches.append(root)
             continue
 
         queue = [root]
@@ -120,7 +134,7 @@ def collect_videos(
                 continue
             visited_folders.add(folder.id)
             print(
-                f"[scan] {folder.name} — videos so far: {len(videos)}",
+                f"[scan] {folder.name} — files so far: {len(matches)}",
                 flush=True,
             )
 
@@ -131,11 +145,11 @@ def collect_videos(
                     continue
                 if child.mime_type == SHORTCUT_MIME_TYPE:
                     continue
-                if is_video(child) and child.id not in seen_video_ids:
-                    seen_video_ids.add(child.id)
-                    videos.append(child)
+                if accept(child) and child.id not in seen_ids:
+                    seen_ids.add(child.id)
+                    matches.append(child)
 
-    return videos
+    return matches
 
 
 # --------------------------------------------------------------------------- #
@@ -233,8 +247,9 @@ def get_copy_restriction(service, file_id: str) -> bool:
     return bool(info.get("copyRequiresWriterPermission", False))
 
 
-def set_copy_restriction(service, file_id: str, *, restricted: bool) -> None:
-    execute_with_retry(
+def set_copy_restriction(service, file_id: str, *, restricted: bool) -> bool:
+    """Set the flag and return the value Drive actually stored (for verify)."""
+    info = execute_with_retry(
         service.files().update(
             fileId=file_id,
             body={"copyRequiresWriterPermission": restricted},
@@ -242,51 +257,67 @@ def set_copy_restriction(service, file_id: str, *, restricted: bool) -> None:
             supportsAllDrives=True,
         )
     )
+    return bool(info.get("copyRequiresWriterPermission", False))
 
 
 def run_block(args: argparse.Namespace) -> int:
+    workers = max(1, min(getattr(args, "workers", 4), 16))
+    all_files = getattr(args, "all_files", False)
     try:
-        service = build_drive_service(args.token)
+        factory = ServiceFactory(args.token)
     except OAuthTokenError as exc:
         print(f"[AUTH ERR] {exc}", file=sys.stderr)
         return 2
     restricted = not args.unblock
     action = "BLOCK" if restricted else "UNBLOCK"
 
-    videos = collect_videos(service, args.folder_id, recursive=args.recursive)
+    targets = collect_videos(
+        factory.primary,
+        args.folder_id,
+        recursive=args.recursive,
+        accept=is_blockable_file if all_files else is_video,
+    )
+    if args.max_items is not None:
+        targets = targets[: args.max_items]
+    kind = "file" if all_files else "video"
     print(
-        f"Found {len(videos)} video(s) across {len(args.folder_id)} folder(s). "
-        f"action={action} dry_run={args.dry_run}"
+        f"Found {len(targets)} {kind}(s) across {len(args.folder_id)} folder(s). "
+        f"action={action} all_files={all_files} workers={workers} "
+        f"dry_run={args.dry_run}"
     )
 
-    success = skipped = failed = 0
-    for index, item in enumerate(videos, start=1):
-        if args.max_items is not None and index > args.max_items:
-            break
+    def process_one(item: DriveItem) -> ItemOutcome:
         label = f"{item.name} ({item.id})"
-
         if args.dry_run:
-            success += 1
-            print(f"[DRY]  {action} {label}")
-            continue
-
+            return ItemOutcome("ok", f"[DRY]  {action} {label}")
+        service = factory.get()
         try:
             if get_copy_restriction(service, item.id) == restricted:
-                skipped += 1
-                print(f"[SKIP] {action} {label}: already {action.lower()}ed")
-                continue
-            set_copy_restriction(service, item.id, restricted=restricted)
-            success += 1
-            print(f"[OK]   {action} {label}")
+                return ItemOutcome(
+                    "skip", f"[SKIP] {action} {label}: already {action.lower()}ed"
+                )
+            applied = set_copy_restriction(service, item.id, restricted=restricted)
+            if applied != restricted:
+                return ItemOutcome(
+                    "fail",
+                    f"[ERR]  {label}: Drive did not apply the {action.lower()} flag",
+                )
+            return ItemOutcome("ok", f"[OK]   {action} {label}")
         except HttpError as exc:
-            failed += 1
-            print(f"[ERR]  {label}: {exc}{_error_hint(exc)}", file=sys.stderr)
+            return ItemOutcome("fail", f"[ERR]  {label}: {exc}{_error_hint(exc)}")
 
-        if args.sleep > 0:
-            time.sleep(args.sleep)
+    counts = run_item_batch(
+        targets,
+        process_one,
+        workers=1 if args.dry_run else workers,
+        sleep_seconds=args.sleep,
+    )
 
-    print(f"Done. {action.lower()}ed={success}, skipped={skipped}, failed={failed}")
-    return 1 if failed else 0
+    print(
+        f"Done. {action.lower()}ed={counts['ok']}, "
+        f"skipped={counts['skip']}, failed={counts['fail']}"
+    )
+    return 1 if counts["fail"] else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -315,8 +346,17 @@ def _add_common_scan_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--sleep",
         type=float,
-        default=1.0,
-        help="Seconds to wait between API calls (default: 1.0).",
+        default=0.0,
+        help=(
+            "Seconds each worker waits after every API call to respect rate "
+            "limits (default: 0.0; raise if you hit HTTP 429)."
+        ),
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel threads (default: 4, max 16).",
     )
     p.add_argument(
         "--dry-run",
@@ -379,6 +419,11 @@ def parse_args() -> argparse.Namespace:
         "--token",
         default="token.json",
         help="OAuth token JSON for the account that OWNS the videos (default: token.json).",
+    )
+    b.add_argument(
+        "--all-files",
+        action="store_true",
+        help="Block every file type (PDF, slides…), not just videos.",
     )
     b.add_argument(
         "--unblock",

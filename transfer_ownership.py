@@ -18,11 +18,13 @@ import json
 import socket
 import ssl
 import sys
+import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from google.auth.exceptions import RefreshError, TransportError
 from google.auth.transport.requests import Request
@@ -321,6 +323,112 @@ def build_drive_service(
             expected_email=expected_email,
         )
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+class ServiceFactory:
+    """Hand out a Drive service per worker thread.
+
+    google-api-python-client builds on httplib2, whose Http object is NOT
+    thread-safe (one shared TCP connection), so each thread needs its own
+    service. Any interactive re-authorization / token refresh happens ONCE in
+    the constructing thread (``primary``); worker threads only load the
+    already-fresh token from disk, so no two threads ever open a browser login
+    or race on the token file.
+    """
+
+    def __init__(
+        self,
+        token_path: str,
+        *,
+        reauth: bool = False,
+        credentials_path: str = "credentials.json",
+        expected_email: str | None = None,
+    ) -> None:
+        self.token_path = token_path
+        # Warm up on the calling thread: trigger reauth/refresh + token persist
+        # now, while we are still single-threaded.
+        self.primary = build_drive_service(
+            token_path,
+            reauth=reauth,
+            credentials_path=credentials_path,
+            expected_email=expected_email,
+        )
+        self._local = threading.local()
+        self._local.service = self.primary
+
+    def get(self) -> Any:
+        service = getattr(self._local, "service", None)
+        if service is None:
+            # Token is already fresh on disk (warmed up above); never reauth in
+            # a worker thread. Auto-refresh after this stays in-memory per
+            # thread, so concurrent workers don't race on the token file.
+            service = build_drive_service(self.token_path)
+            self._local.service = service
+        return service
+
+
+def verify_owner(service: Any, file_id: str, email: str) -> bool:
+    """Return True if `email` is the confirmed (non-pending) owner of the file."""
+    permission = find_permission(service, file_id, email)
+    return bool(
+        permission
+        and permission.get("role") == "owner"
+        and not permission.get("pendingOwner")
+    )
+
+
+@dataclass
+class ItemOutcome:
+    """Result of processing one Drive item in a (possibly parallel) batch."""
+
+    status: str  # "ok" | "skip" | "fail"
+    message: str = ""
+
+
+def run_item_batch(
+    items: list[Any],
+    process_one: Callable[[Any], ItemOutcome],
+    *,
+    workers: int,
+    sleep_seconds: float = 0.0,
+) -> dict[str, int]:
+    """Run ``process_one`` over ``items``, optionally across a thread pool.
+
+    ``process_one`` must be self-contained and thread-safe (build its Drive
+    service via a :class:`ServiceFactory`). It returns an :class:`ItemOutcome`.
+    Logging is serialized so [OK]/[ERR] lines never interleave mid-line, and the
+    aggregate ok/skip/fail counts are returned.
+    """
+    counts = {"ok": 0, "skip": 0, "fail": 0}
+    emit_lock = threading.Lock()
+
+    def emit(outcome: ItemOutcome) -> None:
+        with emit_lock:
+            counts[outcome.status] = counts.get(outcome.status, 0) + 1
+            if outcome.message:
+                stream = sys.stderr if outcome.status == "fail" else sys.stdout
+                print(outcome.message, file=stream, flush=True)
+
+    def work(item: Any) -> ItemOutcome:
+        outcome = process_one(item)
+        # Throttle per worker so a wide pool still respects rate limits.
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+        return outcome
+
+    if workers <= 1:
+        for item in items:
+            emit(work(item))
+        return counts
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(work, item): item for item in items}
+        for future in as_completed(futures):
+            try:
+                emit(future.result())
+            except Exception as exc:  # noqa: BLE001 - keep the batch going
+                emit(ItemOutcome("fail", f"[ERR]  batch worker crashed: {exc}"))
+    return counts
 
 
 def get_file(service: Any, file_id: str) -> DriveItem:

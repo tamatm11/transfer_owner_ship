@@ -114,6 +114,52 @@ def verify_session(request: Request) -> dict | None:
         return None
 
 
+# Best-effort in-memory login throttle: after LOGIN_MAX_ATTEMPTS failures from
+# one IP inside the window, further attempts are rejected with 429 until the
+# window rolls over. A successful login clears the counter so a legitimate user
+# is never locked out by their own earlier typos.
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 15 * 60
+login_attempts: dict[str, dict] = {}
+login_attempts_lock = threading.Lock()
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def login_retry_after(ip: str) -> int:
+    now = time.time()
+    with login_attempts_lock:
+        entry = login_attempts.get(ip)
+        if not entry:
+            return 0
+        if now - entry["first"] > LOGIN_WINDOW_SECONDS:
+            login_attempts.pop(ip, None)
+            return 0
+        if entry["count"] >= LOGIN_MAX_ATTEMPTS:
+            return int(LOGIN_WINDOW_SECONDS - (now - entry["first"])) + 1
+        return 0
+
+
+def record_login_failure(ip: str) -> None:
+    now = time.time()
+    with login_attempts_lock:
+        entry = login_attempts.get(ip)
+        if not entry or now - entry["first"] > LOGIN_WINDOW_SECONDS:
+            login_attempts[ip] = {"count": 1, "first": now}
+        else:
+            entry["count"] += 1
+
+
+def clear_login_attempts(ip: str) -> None:
+    with login_attempts_lock:
+        login_attempts.pop(ip, None)
+
+
 def verify_password(password: str) -> bool:
     plain = os.getenv("OWNER_TOOL_PASSWORD")
     if plain:
@@ -169,6 +215,8 @@ class TransferRequest(BaseModel):
     recursive: bool = True
     no_notify: bool = False
     dry_run: bool = False
+    workers: int = Field(default=4, ge=1, le=16)
+    verify: bool = False
 
 
 class BlockRequest(BaseModel):
@@ -177,6 +225,8 @@ class BlockRequest(BaseModel):
     recursive: bool = True
     unblock: bool = False
     dry_run: bool = False
+    workers: int = Field(default=4, ge=1, le=16)
+    all_files: bool = False
 
 
 def inspect_token(path: Path) -> Account:
@@ -237,6 +287,30 @@ class AccountManager:
             self.active_a = account.email
             save_registry(A_REGISTRY, self.a, self.active_a)
             return account
+
+    def remove(self, role: str, email: str) -> Account:
+        with self.lock:
+            items = self.a if role == "A" else self.b
+            account = find_account(items, email)
+            if account is None:
+                raise KeyError(email)
+            remaining = [x for x in items if x.email.casefold() != account.email.casefold()]
+            if role == "A":
+                self.a = remaining
+                if self.active_a.casefold() == account.email.casefold():
+                    self.active_a = self.a[0].email if self.a else ""
+                save_registry(A_REGISTRY, self.a, self.active_a)
+            else:
+                self.b = remaining
+                save_registry(B_REGISTRY, self.b, "")
+        # Best-effort delete of the managed token file (outside the lock).
+        try:
+            token = Path(account.token_path)
+            if token.is_file():
+                token.unlink()
+        except OSError:
+            pass
+        return account
 
 
 accounts = AccountManager()
@@ -465,10 +539,21 @@ def auth_session(request: Request) -> dict:
 
 
 @app.post("/api/auth/login")
-def auth_login(request: LoginRequest, response: Response) -> dict:
+def auth_login(request: LoginRequest, response: Response, http_request: Request) -> dict:
+    ip = client_ip(http_request)
+    retry_after = login_retry_after(ip)
+    if retry_after:
+        minutes = -(-retry_after // 60)
+        raise HTTPException(
+            429,
+            f"Quá nhiều lần đăng nhập sai. Thử lại sau {minutes} phút.",
+            headers={"Retry-After": str(retry_after)},
+        )
     email = (request.email or ALLOWED_EMAIL).strip().lower()
     if email != ALLOWED_EMAIL or not verify_password(request.password):
+        record_login_failure(ip)
         raise HTTPException(401, "Email hoặc mật khẩu không đúng")
+    clear_login_attempts(ip)
     response.set_cookie(
         SESSION_COOKIE,
         create_session(email),
@@ -547,6 +632,18 @@ def activate(role: str, email: str) -> dict:
         raise HTTPException(400, "Account token is missing")
 
 
+@app.delete("/api/accounts/{role}/{email}")
+def delete_account(role: str, email: str) -> dict:
+    role = role.upper()
+    if role not in ("A", "B"):
+        raise HTTPException(400, "Vai trò không hợp lệ (chỉ A hoặc B)")
+    try:
+        account = accounts.remove(role, email)
+    except KeyError:
+        raise HTTPException(404, f"Account {role} không tồn tại: {email}")
+    return {"ok": True, "role": role, "email": account.email, "active_a": accounts.active_a or None}
+
+
 @app.post("/api/jobs/transfer", status_code=202)
 def transfer(request: TransferRequest) -> dict:
     owner, commands = validate_owner(request.owner_email), []
@@ -559,12 +656,14 @@ def transfer(request: TransferRequest) -> dict:
             raise HTTPException(400, f"Account B token is missing: {row.receiver_email}")
         cmd = [sys.executable, "-u", str(TRANSFER_SCRIPT), "--folders", ",".join(folder_ids),
             "--to-email", receiver.email, "--owner-token", owner.token_path,
-            "--mode", request.mode, "--transfer-scope", request.scope]
+            "--mode", request.mode, "--transfer-scope", request.scope,
+            "--workers", str(request.workers)]
         if request.mode == "consumer" and not request.dry_run:
             cmd += ["--accept-token", receiver.token_path, "--credentials", str(CREDENTIALS),
                 "--reauth-accept-token"]
         if not request.recursive: cmd.append("--no-recursive")
         if request.no_notify: cmd.append("--no-notify")
+        if request.verify: cmd.append("--verify")
         if request.dry_run: cmd.append("--dry-run")
         commands.append(cmd)
     job = start_job("transfer", commands)
@@ -574,9 +673,11 @@ def transfer(request: TransferRequest) -> dict:
 @app.post("/api/jobs/block", status_code=202)
 def block(request: BlockRequest) -> dict:
     owner = validate_owner(request.owner_email)
-    cmd = [sys.executable, "-u", str(PROTECT_SCRIPT), "block", "--token", owner.token_path]
+    cmd = [sys.executable, "-u", str(PROTECT_SCRIPT), "block", "--token", owner.token_path,
+        "--workers", str(request.workers)]
     for folder_id in validate_folders(owner, request.folders): cmd += ["--folder-id", folder_id]
     if request.recursive: cmd.append("--recursive")
+    if request.all_files: cmd.append("--all-files")
     if request.unblock: cmd.append("--unblock")
     if request.dry_run: cmd.append("--dry-run")
     job = start_job("block", [cmd])

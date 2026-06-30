@@ -106,6 +106,14 @@ def token_path(paths, role, email):
     return path
 
 
+def _workers(payload):
+    """Clamp the requested worker count to a safe 1..16 range (default 4)."""
+    try:
+        return max(1, min(int(payload.get("workers", 4)), 16))
+    except (TypeError, ValueError):
+        return 4
+
+
 def run(cmd):
     log("$ " + " ".join(cmd[2:]))  # skip python -u for readability
     return subprocess.call(cmd, cwd=str(ROOT))
@@ -134,6 +142,7 @@ def run_transfer(payload, paths):
             "--owner-token", owner_token,
             "--mode", mode,
             "--transfer-scope", scope,
+            "--workers", str(_workers(payload)),
         ]
         if mode == "consumer" and not payload.get("dry_run"):
             cmd += ["--accept-token", token_path(paths, "B", to_email),
@@ -142,6 +151,8 @@ def run_transfer(payload, paths):
             cmd += ["--no-recursive"]
         if payload.get("no_notify"):
             cmd += ["--no-notify"]
+        if payload.get("verify"):
+            cmd += ["--verify"]
         if payload.get("dry_run"):
             cmd += ["--dry-run"]
         log(f"::group::[{index}/{len(rows)}] Transfer {owner_email} -> {to_email}")
@@ -158,11 +169,14 @@ def run_block(payload, paths):
     folders = payload.get("folders", [])
     if not folders:
         raise SystemExit("Payload block không có folder nào.")
-    cmd = [sys.executable, "-u", "protect_videos.py", "block", "--token", owner_token]
+    cmd = [sys.executable, "-u", "protect_videos.py", "block", "--token", owner_token,
+           "--workers", str(_workers(payload))]
     for fid in folders:
         cmd += ["--folder-id", fid]
     if payload.get("recursive"):
         cmd += ["--recursive"]
+    if payload.get("all_files"):
+        cmd += ["--all-files"]
     if payload.get("unblock"):
         cmd += ["--unblock"]
     if payload.get("dry_run"):

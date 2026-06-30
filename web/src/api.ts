@@ -38,6 +38,7 @@ export const api = {
   oauth: (role: Role) => request<{ id?: string; oauth_id?: string; url?: string; authorization_url?: string }>('/api/accounts/oauth', { method: 'POST', body: JSON.stringify({ role }) }),
   oauthStatus: (id: string) => request<Record<string, unknown>>(`/api/oauth/${id}`),
   activate: (role: Role, email: string) => request<Account>(`/api/accounts/${role}/${encodeURIComponent(email)}/activate`, { method: 'POST' }),
+  remove: (role: Role, email: string) => request<{ ok: boolean; active_a?: string | null }>(`/api/accounts/${role}/${encodeURIComponent(email)}`, { method: 'DELETE' }),
   startTransfer: async (body: unknown) => normalizeJob(await request<RawJob>('/api/jobs/transfer', { method: 'POST', body: JSON.stringify(body) })),
   startBlock: async (body: unknown) => normalizeJob(await request<RawJob>('/api/jobs/block', { method: 'POST', body: JSON.stringify(body) })),
   job: async (id: string) => normalizeJob(await request<RawJob>(`/api/jobs/${id}`)),

@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { google } from 'googleapis'
-import { storeConfigured, readBundle, writeBundle, upsertAccount } from './_store.js'
+import { storeConfigured, readBundle, writeBundle, upsertAccount, removeAccount } from './_store.js'
 import { oauthConfigured, callbackUrl, signState, verifyState, buildAuthUrl, exchangeCode } from './_oauth.js'
 
 export const config = { api: { bodyParser: true } }
@@ -100,6 +100,44 @@ function verifySession(req) {
     return { email: data.email }
   } catch {
     return null
+  }
+}
+
+// Best-effort login throttle. Serverless instances aren't shared, so this only
+// slows brute force within a warm instance — but for a single-user tool that's
+// enough to blunt credential stuffing, and a successful login clears the counter
+// so a legitimate user is never locked out.
+const LOGIN_MAX_ATTEMPTS = 5
+const LOGIN_WINDOW_MS = 15 * 60 * 1000
+const loginAttempts = globalThis.__ownerToolLoginAttempts || new Map()
+globalThis.__ownerToolLoginAttempts = loginAttempts
+
+function clientIp(req) {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+  return fwd || req.socket?.remoteAddress || 'unknown'
+}
+
+function loginThrottle(ip) {
+  const now = Date.now()
+  const entry = loginAttempts.get(ip)
+  if (!entry) return { blocked: false }
+  if (now - entry.first > LOGIN_WINDOW_MS) {
+    loginAttempts.delete(ip)
+    return { blocked: false }
+  }
+  if (entry.count >= LOGIN_MAX_ATTEMPTS) {
+    return { blocked: true, retryAfter: Math.ceil((LOGIN_WINDOW_MS - (now - entry.first)) / 1000) }
+  }
+  return { blocked: false }
+}
+
+function recordLoginFailure(ip) {
+  const now = Date.now()
+  const entry = loginAttempts.get(ip)
+  if (!entry || now - entry.first > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { count: 1, first: now })
+  } else {
+    entry.count += 1
   }
 }
 
@@ -302,16 +340,48 @@ function isVideo(item) {
   return String(item.mimeType || '').startsWith(VIDEO_PREFIX)
 }
 
-async function collectVideos(drive, folderIds, recursive, logs) {
-  const videos = []
-  const seenVideos = new Set()
+function isBlockableFile(item) {
+  const mime = String(item.mimeType || '')
+  return mime !== FOLDER_MIME && mime !== SHORTCUT_MIME
+}
+
+function clampWorkers(value, fallback = 4) {
+  const n = Number.parseInt(value, 10)
+  if (!Number.isFinite(n)) return fallback
+  return Math.max(1, Math.min(n, 16))
+}
+
+// Run `worker(item)` over items with at most `limit` in flight at once. Order of
+// completion is irrelevant (each item is independent), so this is a plain
+// bounded pool — much faster than the old sequential loop within the serverless
+// time budget. The googleapis client is async/await safe to share concurrently.
+async function runPool(items, limit, worker) {
+  const queue = items.slice()
+  const size = Math.max(1, Math.min(limit, queue.length || 1))
+  const runners = Array.from({ length: size }, async () => {
+    while (queue.length) {
+      const item = queue.shift()
+      await worker(item)
+    }
+  })
+  await Promise.all(runners)
+}
+
+async function verifyOwner(drive, fileId, email) {
+  const permission = await findPermission(drive, fileId, email)
+  return Boolean(permission && permission.role === 'owner' && !permission.pendingOwner)
+}
+
+async function collectVideos(drive, folderIds, recursive, logs, accept = isVideo) {
+  const matches = []
+  const seen = new Set()
   const visitedFolders = new Set()
   for (const folderId of folderIds) {
     const root = await getFile(drive, folderId)
     if (root.mimeType !== FOLDER_MIME) {
-      if (isVideo(root) && !seenVideos.has(root.id)) {
-        seenVideos.add(root.id)
-        videos.push(root)
+      if (accept(root) && !seen.has(root.id)) {
+        seen.add(root.id)
+        matches.push(root)
       }
       continue
     }
@@ -320,21 +390,21 @@ async function collectVideos(drive, folderIds, recursive, logs) {
       const folder = queue.shift()
       if (visitedFolders.has(folder.id)) continue
       visitedFolders.add(folder.id)
-      logs.push(`[scan] ${folder.name} — videos=${videos.length}`)
+      logs.push(`[scan] ${folder.name} — files=${matches.length}`)
       for (const child of await listChildren(drive, folder.id)) {
         if (child.mimeType === FOLDER_MIME) {
           if (recursive) queue.push(child)
           continue
         }
         if (child.mimeType === SHORTCUT_MIME) continue
-        if (isVideo(child) && !seenVideos.has(child.id)) {
-          seenVideos.add(child.id)
-          videos.push(child)
+        if (accept(child) && !seen.has(child.id)) {
+          seen.add(child.id)
+          matches.push(child)
         }
       }
     }
   }
-  return videos
+  return matches
 }
 
 async function collectTransferItems(drive, folderIds, recursive, scope, logs) {
@@ -530,6 +600,8 @@ function buildTransferPayload(body) {
     no_recursive: body.recursive === false,
     no_notify: Boolean(body.no_notify),
     dry_run: Boolean(body.dry_run),
+    workers: clampWorkers(body.workers),
+    verify: Boolean(body.verify),
     rows: outRows,
   }
 }
@@ -545,6 +617,8 @@ function buildBlockPayload(body) {
     recursive: body.recursive !== false,
     unblock: Boolean(body.unblock),
     dry_run: Boolean(body.dry_run),
+    workers: clampWorkers(body.workers),
+    all_files: Boolean(body.all_files),
   }
 }
 
@@ -712,6 +786,8 @@ async function handleTransfer(body) {
   const ownerDrive = driveFromToken(owner.token)
   const rows = Array.isArray(body.rows) ? body.rows : []
   if (!rows.length) throw Object.assign(new Error('Cần ít nhất một dòng transfer'), { status: 422 })
+  const workers = clampWorkers(body.workers)
+  const verify = Boolean(body.verify)
   let success = 0
   let failed = 0
   for (const row of rows) {
@@ -722,24 +798,32 @@ async function handleTransfer(body) {
     const items = await collectTransferItems(ownerDrive, folderIds, body.recursive !== false, body.scope || 'videos', logs)
     const videoCount = items.filter(isVideo).length
     const folderCount = items.filter(item => item.mimeType === FOLDER_MIME).length
-    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${videoCount} video(s), ${folderCount} folder(s). mode=${body.mode || 'consumer'} dry_run=${Boolean(body.dry_run)}`)
-    for (const item of items) {
+    logs.push(`Resolved ${folderIds.length} folder(s). Selected ${videoCount} video(s), ${folderCount} folder(s). mode=${body.mode || 'consumer'} workers=${workers} verify=${verify} dry_run=${Boolean(body.dry_run)}`)
+    await runPool(items, body.dry_run ? 1 : workers, async (item) => {
       const label = `${item.name} (${item.id})`
       if (body.dry_run) {
         success += 1
         logs.push(`[DRY]  ${label}`)
-        continue
+        return
       }
       try {
         if (body.mode === 'workspace') await transferWorkspace(ownerDrive, item.id, receiver.email, !body.no_notify)
         else await transferConsumer(ownerDrive, acceptDrive, item, receiver.email, !body.no_notify)
+        if (verify) {
+          const checkDrive = acceptDrive || ownerDrive
+          if (!(await verifyOwner(checkDrive, item.id, receiver.email))) {
+            failed += 1
+            logs.push(`[ERR]  ${label}: verify failed — ${receiver.email} is not the confirmed owner yet`)
+            return
+          }
+        }
         success += 1
         logs.push(`[OK]   ${label}`)
       } catch (error) {
         failed += 1
         logs.push(`[ERR]  ${label}: ${error.message || error}`)
       }
-    }
+    })
   }
   logs.push(`Done. transferred=${success}, failed=${failed}`)
   return newJob('transfer', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
@@ -752,18 +836,21 @@ async function handleBlock(body) {
   const drive = driveFromToken(owner.token)
   const folderIds = (body.folders || []).map(extractFolderId)
   if (!folderIds.length) throw Object.assign(new Error('Cần ít nhất một folder'), { status: 422 })
-  const videos = await collectVideos(drive, folderIds, body.recursive !== false, logs)
+  const allFiles = Boolean(body.all_files)
+  const workers = clampWorkers(body.workers)
+  const targets = await collectVideos(drive, folderIds, body.recursive !== false, logs, allFiles ? isBlockableFile : isVideo)
   const restricted = !body.unblock
   const action = restricted ? 'BLOCK' : 'UNBLOCK'
-  logs.push(`Found ${videos.length} video(s) across ${folderIds.length} folder(s). action=${action} dry_run=${Boolean(body.dry_run)}`)
+  const kind = allFiles ? 'file' : 'video'
+  logs.push(`Found ${targets.length} ${kind}(s) across ${folderIds.length} folder(s). action=${action} all_files=${allFiles} workers=${workers} dry_run=${Boolean(body.dry_run)}`)
   let success = 0
   let failed = 0
-  for (const item of videos) {
+  await runPool(targets, body.dry_run ? 1 : workers, async (item) => {
     const label = `${item.name} (${item.id})`
     if (body.dry_run) {
       success += 1
       logs.push(`[DRY]  ${action} ${label}`)
-      continue
+      return
     }
     try {
       await setCopyRestriction(drive, item.id, restricted)
@@ -773,7 +860,7 @@ async function handleBlock(body) {
       failed += 1
       logs.push(`[ERR]  ${label}: ${error.message || error}`)
     }
-  }
+  })
   logs.push(`Done. ${action.toLowerCase()}ed=${success}, failed=${failed}`)
   return newJob('block', logs, failed ? 'failed' : 'completed', failed ? 1 : 0)
 }
@@ -805,11 +892,19 @@ export default async function handler(req, res) {
     }
 
     if (route === '/auth/login' && req.method === 'POST') {
+      const ip = clientIp(req)
+      const throttle = loginThrottle(ip)
+      if (throttle.blocked) {
+        res.setHeader('Retry-After', String(throttle.retryAfter))
+        return json(res, 429, { message: `Quá nhiều lần đăng nhập sai. Thử lại sau ${Math.ceil(throttle.retryAfter / 60)} phút.` })
+      }
       const body = await getBody(req)
       const email = String(body.email || ALLOWED_EMAIL).trim().toLowerCase()
       if (email !== ALLOWED_EMAIL || !verifyPassword(String(body.password || ''))) {
+        recordLoginFailure(ip)
         return json(res, 401, { message: 'Email hoặc mật khẩu không đúng' })
       }
+      loginAttempts.delete(ip)
       res.setHeader('Set-Cookie', serializeCookie(SESSION_COOKIE, createSession(email), { maxAge: SESSION_TTL_SECONDS }))
       return json(res, 200, { user: { email } })
     }
@@ -878,6 +973,27 @@ export default async function handler(req, res) {
     if (parts[0] === 'oauth' && parts[1] && req.method === 'GET') {
       // Legacy local poll endpoint (/oauth/{id}); the web flow no longer polls.
       return json(res, 404, { message: 'OAuth web không dùng polling — đợi cửa sổ Google đóng lại.' })
+    }
+
+    // Delete an account (A or B). Persisted to the shared gist so the GitHub
+    // Actions runner stops seeing it too. Requires the gist store — the static
+    // env/local fallback bundle is read-only at runtime.
+    if (parts[0] === 'accounts' && parts[1] && parts[2] && parts.length === 3 && req.method === 'DELETE') {
+      const role = String(parts[1] || '').toUpperCase()
+      const email = decodeURIComponent(parts[2] || '')
+      if (role !== 'A' && role !== 'B') return json(res, 400, { message: 'Vai trò không hợp lệ (chỉ A hoặc B)' })
+      const account = findAccount(role, email)
+      if (!account) return json(res, 404, { message: `Account ${role} không tồn tại: ${email}` })
+      if (!storeConfigured()) {
+        return json(res, 501, { message: 'Xóa tài khoản cần gist store (đặt GH_API_TOKEN + OWNER_TOOL_GIST_ID).' })
+      }
+      const bundle = removeAccount(globalThis.__ownerToolBundle || { version: 1, active_a: '', A: [], B: [] }, role, account.email)
+      await writeBundle(bundle)
+      globalThis.__ownerToolBundle = bundle
+      if (role === 'A' && String(globalThis.__ownerToolActiveA || '').toLowerCase() === account.email.toLowerCase()) {
+        globalThis.__ownerToolActiveA = bundle.active_a || ''
+      }
+      return json(res, 200, { ok: true, role, email: account.email, active_a: bundle.active_a || null })
     }
 
     if (parts[0] === 'accounts' && parts[3] === 'activate' && req.method === 'POST') {

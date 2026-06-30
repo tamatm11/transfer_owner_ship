@@ -72,6 +72,7 @@ export default function App() {
     window.setTimeout(() => window.clearInterval(timer), 180000)
   }
   const activate = async (account: Account) => { try { await api.activate(account.role, account.email); await refreshAccounts() } catch (error) { setNotice((error as Error).message) } }
+  const removeAccount = async (account: Account) => { if (!window.confirm(`Xóa tài khoản ${account.role} "${account.email}"? Token sẽ bị gỡ khỏi hệ thống.`)) return; setNotice(''); try { await api.remove(account.role, account.email); setNotice(`Đã xóa tài khoản ${account.role}: ${account.email}`); await refreshAccounts() } catch (error) { setNotice((error as Error).message) } }
   const stop = async () => { if (!job?.id) return; try { const next = await api.stop(job.id); setJob(next); setJobs(all => all.map(item => item.id === next.id ? next : item)) } catch (error) { setNotice((error as Error).message) } }
   const login = async (password: string) => { setLoading(true); setNotice(''); try { const result = await api.login(password); setUserEmail(result.user.email); await refreshAccounts() } catch (error) { setNotice((error as Error).message) } finally { setLoading(false) } }
   const logout = async () => { try { await api.logout() } finally { setUserEmail(''); setAccounts([]); setJob(undefined); setJobs([]); setLogsOpen(false) } }
@@ -85,7 +86,7 @@ export default function App() {
         {notice && <div className="notice" role="alert"><span>{notice}</span><button onClick={() => setNotice('')}>×</button></div>}
         {view === 'transfer' && <TransferForm accounts={accounts} ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('transfer', payload)} />}
         {view === 'block' && <BlockForm ownerEmail={activeA?.email || ''} busy={loading} onSubmit={payload => startJob('block', payload)} />}
-        {view === 'accounts' && <Accounts accounts={accounts} loading={loading} onConnect={connectAccount} onActivate={activate} />}
+        {view === 'accounts' && <Accounts accounts={accounts} loading={loading} onConnect={connectAccount} onActivate={activate} onDelete={removeAccount} />}
         {view === 'history' && <History jobs={jobs} onSelect={selected => { setJob(selected); setLogsOpen(true) }} />}
       </div>
       <div className="log-backdrop" onClick={() => setLogsOpen(false)} />
