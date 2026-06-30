@@ -1,14 +1,14 @@
 # Secrets - never commit
-.env
-.env.*
-!.env.example
-token.json
-token_B.json
-credentials.json
-account_b_accounts.json
-account_b_tokens/
-account_a_accounts.json
-account_a_tokens/
+/.env
+/.env.*
+!/.env.example
+/credentials.json
+/token.json
+/token_B.json
+/account_a_accounts.json
+/account_b_accounts.json
+/account_a_tokens/
+/account_b_tokens/
 __pycache__/
 *.pyc
 .web_*.log
@@ -20,6 +20,3 @@ node_modules/
 web/dist/
 *.tsbuildinfo
 .vercel/
-
-.vercel
-.env*

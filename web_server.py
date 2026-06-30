@@ -20,7 +20,7 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import WSGIRequestHandler, make_server
 
 from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -525,6 +525,16 @@ def start_job(kind: str, commands: list[list[str]]) -> Job:
 
 
 app = FastAPI(title="Owner Video Tool", version="1.0.0")
+
+PUBLIC_API_PATHS = {"/api/health", "/api/auth/session", "/api/auth/login"}
+
+
+@app.middleware("http")
+async def require_api_session(request: Request, call_next):
+    path = request.url.path.rstrip("/") or "/"
+    if path.startswith("/api/") and path not in PUBLIC_API_PATHS and not verify_session(request):
+        return JSONResponse(status_code=401, content={"detail": "Vui lòng đăng nhập lại"})
+    return await call_next(request)
 
 
 @app.get("/api/health")
